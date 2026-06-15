@@ -1,0 +1,4490 @@
+AtrainCrt_bot Command Prompt Run pasted below.
+
+
+
+
+cd "C:\Users\Ray Anthony\Desktop\AtrainCrtBot"
+venv\Scripts\activate.bat
+python bot.py
+
+
+
+# ─── Python Dependencies ───────────────────────────────────────────────────
+python-telegram-bot==21.10
+aiohttp==3.11.18
+python-dotenv==1.0.1
+
+
+
+
+"""
+╔══════════════════════════════════════════════════════════════╗
+║          BINARY SIGNAL ROBOT — TELEGRAM BOT  v2.0            ║
+║   Expert 1-Minute Binary Options Signal Bot                  ║
+║   Powered by Candle Psychology + CRT + RSI + ATR Filters     ║
+║                                                              ║
+║   NEW IN v2.0                                                ║
+║   ✦ Tap-only pair selection — no typing ever                 ║
+║   ✦ Category tabs → pair grid → instant signal               ║
+║   ✦ Clear entry: ENTER NOW  vs  NEXT CANDLE OPEN             ║
+║   ✦ Post-signal toggle: Change Pair | Same Pair              ║
+║   ✦ Single active pair per user — focused trading            ║
+║   ✦ Removed: /watch /unwatch /signal /watchlist              ║
+║                                                              ║
+║   Commands:                                                  ║
+║   /start   — Welcome + category selector                     ║
+║   /pairs   — Back to category/pair selector any time         ║
+║   /stats   — Performance stats for this session              ║
+║   /stop    — Pause all signals                               ║
+║   /resume  — Resume + re-open pair selector                  ║
+║   /help    — Command reference                               ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+
+import asyncio
+import logging
+import os
+from datetime import datetime, timezone
+from typing import Optional
+from dotenv import load_dotenv
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    ContextTypes, JobQueue
+)
+from telegram.constants import ParseMode
+
+from data_feed import TwelveDataFeed, ASSET_CATALOGUE, find_asset
+from signal_engine import ConfluenceEngine, FinalSignal
+from candle_psychology import Candle
+
+load_dotenv()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("BinaryRobot")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OTC PAIRS  (Pocket Option synthetic pairs — data proxied from real market)
+# ─────────────────────────────────────────────────────────────────────────────
+OTC_PAIRS = {
+    "EUR/USD-OTC": "EUR/USD",
+    "GBP/USD-OTC": "GBP/USD",
+    "USD/JPY-OTC": "USD/JPY",
+    "AUD/USD-OTC": "AUD/USD",
+    "USD/CAD-OTC": "USD/CAD",
+    "USD/CHF-OTC": "USD/CHF",
+    "EUR/JPY-OTC": "EUR/JPY",
+    "EUR/GBP-OTC": "EUR/GBP",
+    "GBP/JPY-OTC": "GBP/JPY",
+    "NZD/USD-OTC": "NZD/USD",
+    "EUR/AUD-OTC": "EUR/AUD",
+    "AUD/JPY-OTC": "AUD/JPY",
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CATEGORY DISPLAY CONFIG
+# Each entry: (callback_id, icon, label, symbols_list, cols_per_row)
+# ─────────────────────────────────────────────────────────────────────────────
+CATEGORY_DISPLAY = [
+    ("forex",       "💱", "Forex Majors",
+     list(ASSET_CATALOGUE["Forex"].keys()), 3),
+
+    ("otc",         "🔵", "OTC Pairs",
+     list(OTC_PAIRS.keys()), 2),
+
+    ("crypto",      "₿",  "Crypto",
+     list(ASSET_CATALOGUE["Crypto"].keys()), 3),
+
+    ("commodities", "🥇", "Commodities",
+     list(ASSET_CATALOGUE["Commodities"].keys()), 2),
+
+    ("stocks",      "📈", "Stocks",
+     list(ASSET_CATALOGUE["Stocks"].keys()), 3),
+
+    ("indices",     "📊", "Indices",
+     list(ASSET_CATALOGUE["Indices"].keys()), 3),
+]
+
+# Build fast lookups
+_CAT_BY_ID   = {cid: (icon, label, syms, cols) for cid, icon, label, syms, cols in CATEGORY_DISPLAY}
+_SYM_TO_CAT  = {}
+for cid, icon, label, syms, cols in CATEGORY_DISPLAY:
+    for s in syms:
+        _SYM_TO_CAT[s] = cid
+
+
+def resolve_symbol(symbol: str) -> str:
+    """OTC symbol → real market symbol for data fetching."""
+    return OTC_PAIRS.get(symbol, symbol)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KEYBOARD BUILDERS  (all UI lives here — pure functions for easy testing)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_category_keyboard() -> InlineKeyboardMarkup:
+    """Main menu: one button per category, 2 per row."""
+    keyboard = []
+    row = []
+    for cid, icon, label, _, _ in CATEGORY_DISPLAY:
+        row.append(InlineKeyboardButton(f"{icon} {label}", callback_data=f"cat_{cid}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_pairs_keyboard(cat_id: str) -> InlineKeyboardMarkup:
+    """Pair grid for a category + Back button."""
+    icon, label, syms, cols = _CAT_BY_ID[cat_id]
+    keyboard = []
+    row = []
+    for sym in syms:
+        # Strip -OTC suffix for display width, keep full name as callback
+        display = sym.replace("-OTC", " OTC")
+        row.append(InlineKeyboardButton(display, callback_data=f"pair_{sym}"))
+        if len(row) == cols:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("⬅️ Categories", callback_data="cat_menu")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_post_signal_keyboard() -> InlineKeyboardMarkup:
+    """Toggle shown below every signal message."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📂 Change Pair",  callback_data="change_pair"),
+        InlineKeyboardButton("🔄 Same Pair",    callback_data="same_pair"),
+    ]])
+
+
+def build_paused_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("▶️ Resume & Pick Pair", callback_data="resume_pick"),
+    ]])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MESSAGE FORMATTER
+# ─────────────────────────────────────────────────────────────────────────────
+class MessageFormatter:
+
+    @staticmethod
+    def signal_message(sig: FinalSignal, elapsed: int = 0) -> str:
+        """
+        Formats a FinalSignal into a Telegram message.
+
+        ENTRY CLARITY:
+          pre_close = True  →  ⚡ ENTER NOW  (candle closing, next open imminent)
+          pre_close = False →  ⏱ NEXT CANDLE  (enter at open of next candle)
+        """
+        direction_emoji = "📈" if sig.direction == "CALL" else "📉"
+        direction_color = "🟢" if sig.direction == "CALL" else "🔴"
+
+        # ── Confidence bar ────────────────────────────────────────────────────
+        filled = int(sig.confidence / 10)
+        bar    = "█" * filled + "░" * (10 - filled)
+
+        if sig.confidence >= 85:
+            strength = "🔥 EXTREME"
+        elif sig.confidence >= 73:
+            strength = "💪 STRONG"
+        elif sig.confidence >= 62:
+            strength = "✅ MODERATE"
+        else:
+            strength = "⚠️ WEAK"
+
+        # ── ENTRY BLOCK — the most important visual element ───────────────────
+        if sig.pre_close:
+            secs_left = max(0, 60 - elapsed)
+            entry_block = (
+                f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+                f"┃  ⚡⚡  E N T E R   N O W  ⚡⚡  ┃\n"
+                f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+                f"_Place trade immediately_\n"
+                f"_Candle closing in ~{secs_left}s — next open is your entry_"
+            )
+        else:
+            entry_block = (
+                f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+                f"┃  ⏱  N E X T  C A N D L E  ⏱  ┃\n"
+                f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+                f"_Wait for current candle to close_\n"
+                f"_Enter at the OPEN of the next candle_"
+            )
+
+        # ── Confluence block ──────────────────────────────────────────────────
+        confluence_text = "\n".join(f"  {f}" for f in sig.confluence_factors)
+
+        msg = (
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{direction_emoji} *BINARY SIGNAL*  {direction_color}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 *Asset:*    `{sig.asset}`\n"
+            f"🎯 *Action:*   *{sig.direction}*  "
+            f"({'UP ↑' if sig.direction == 'CALL' else 'DOWN ↓'})\n"
+            f"⏱ *Expiry:*  `{sig.expiry}`\n\n"
+            f"📐 *Pattern:* {sig.candle_emoji} _{sig.candle_pattern}_\n"
+            f"💬 _{sig.candle_description}_\n\n"
+            f"📊 *Confidence:* `{sig.confidence}%`  {strength}\n"
+            f"`[{bar}]`\n\n"
+            f"🔍 *Confluence:*\n"
+            f"{confluence_text}\n\n"
+            f"🕐 `{sig.timestamp}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{entry_block}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"_Risk responsibly. 1–3% per trade._"
+        )
+        return msg
+
+    @staticmethod
+    def no_signal_message(symbol: str) -> str:
+        return (
+            f"🔍 *No Signal — `{symbol}`*\n\n"
+            f"No high-confluence setup detected.\n"
+            f"_Threshold: 62% — market may be choppy_\n\n"
+            f"Tap *Same Pair* to re-scan or *Change Pair* to pick another."
+        )
+
+    @staticmethod
+    def welcome_message(name: str) -> str:
+        return (
+            f"👋 Welcome, *{name}*!\n\n"
+            f"🤖 *Binary Signal Robot v2.0*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"I scan live M1 candles using:\n"
+            f"  🕯 *Candle Psychology* (12+ patterns)\n"
+            f"  📐 *CRT + Volume* sweep detection\n"
+            f"  📊 *RSI + ATR* accuracy filters\n"
+            f"  🕰 *EMA 9/21/50* trend alignment\n"
+            f"  🏔 *Support & Resistance* levels\n\n"
+            f"*How it works:*\n"
+            f"  1️⃣  Pick a *category* below\n"
+            f"  2️⃣  Tap a *pair* — signal fires instantly\n"
+            f"  3️⃣  Bot auto-scans every 60s from there\n"
+            f"  4️⃣  After each signal — tap *Change* or *Same*\n\n"
+            f"📡 *Assets:* Forex · OTC · Crypto · Commodities · Stocks · Indices\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"_Select a category to begin:_"
+        )
+
+    @staticmethod
+    def category_menu_text() -> str:
+        return (
+            "📂 *Select a Category*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "_Tap a category to see available pairs:_"
+        )
+
+    @staticmethod
+    def pairs_menu_text(icon: str, label: str, count: int) -> str:
+        return (
+            f"{icon} *{label}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"_Tap a pair to start receiving signals:_\n"
+            f"_{count} pairs available_"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BOT STATE  (one active pair per user — no watchlists)
+# ─────────────────────────────────────────────────────────────────────────────
+class BotState:
+    def __init__(self):
+        self.active_pair: dict[int, str]  = {}   # chat_id → current pair symbol
+        self.paused:      set[int]        = set()
+        self.stats:       dict[int, dict] = {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN BOT
+# ─────────────────────────────────────────────────────────────────────────────
+class BinarySignalBot:
+
+    SCAN_INTERVAL     = 60   # seconds between auto-scans
+    PRE_CLOSE_TRIGGER = 45   # seconds into candle: pre-close window
+
+    def __init__(self, telegram_token: str, twelve_api_key: str):
+        self.token     = telegram_token
+        self.feed      = TwelveDataFeed(twelve_api_key)
+        self.engine    = ConfluenceEngine()
+        self.formatter = MessageFormatter()
+        self.state     = BotState()
+        self.app       = Application.builder().token(telegram_token).job_queue(JobQueue()).build()
+        self._register_handlers()
+
+    # ── HANDLER REGISTRATION ──────────────────────────────────────────────────
+
+    def _register_handlers(self):
+        self.app.add_handler(CommandHandler("start",  self.cmd_start))
+        self.app.add_handler(CommandHandler("pairs",  self.cmd_pairs))
+        self.app.add_handler(CommandHandler("help",   self.cmd_help))
+        self.app.add_handler(CommandHandler("stats",  self.cmd_stats))
+        self.app.add_handler(CommandHandler("stop",   self.cmd_stop))
+        self.app.add_handler(CommandHandler("resume", self.cmd_resume))
+        self.app.add_handler(CallbackQueryHandler(self.handle_callback))
+
+    # ── STATE HELPERS ─────────────────────────────────────────────────────────
+
+    def _ensure_state(self, chat_id: int):
+        if chat_id not in self.state.stats:
+            self.state.stats[chat_id] = {"signals_sent": 0, "calls": 0, "puts": 0}
+
+    def _start_scan_job(self, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
+        """
+        Cancel any existing scan job for this chat, then start a new one.
+        Called whenever the user selects a new pair.
+        """
+        job_name = f"scan_{chat_id}"
+        # Remove existing jobs for this chat
+        for job in ctx.job_queue.get_jobs_by_name(job_name):
+            job.schedule_removal()
+        # Start fresh scan
+        ctx.job_queue.run_repeating(
+            self._auto_scan_job,
+            interval=self.SCAN_INTERVAL,
+            first=self.SCAN_INTERVAL,  # First auto-scan after 60s; immediate is manual
+            name=job_name,
+            data={"chat_id": chat_id}
+        )
+
+    def _record_stat(self, chat_id: int, sig: FinalSignal):
+        self._ensure_state(chat_id)
+        s = self.state.stats[chat_id]
+        s["signals_sent"] += 1
+        s["calls"] += (1 if sig.direction == "CALL" else 0)
+        s["puts"]  += (1 if sig.direction == "PUT"  else 0)
+
+    # ── COMMANDS ─────────────────────────────────────────────────────────────
+
+    async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        self._ensure_state(chat_id)
+        name = update.effective_user.first_name or "Trader"
+
+        await update.message.reply_text(
+            self.formatter.welcome_message(name),
+            reply_markup=build_category_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    async def cmd_pairs(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Shortcut to re-open the category selector at any time."""
+        await update.message.reply_text(
+            self.formatter.category_menu_text(),
+            reply_markup=build_category_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    async def cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        active  = self.state.active_pair.get(chat_id)
+        active_text = f"`{active}`" if active else "_none selected_"
+
+        msg = (
+            "🤖 *Binary Signal Robot v2.0 — Help*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "*/start*  — Welcome screen + pair selector\n"
+            "*/pairs*  — Open category/pair selector any time\n"
+            "*/stats*  — Session performance stats\n"
+            "*/stop*   — Pause auto-signals\n"
+            "*/resume* — Resume + re-open pair selector\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "*How to use:*\n"
+            "  1️⃣  Tap a category\n"
+            "  2️⃣  Tap a pair → signal fires immediately\n"
+            "  3️⃣  Bot auto-scans that pair every 60s\n"
+            "  4️⃣  After signal → tap *Change Pair* or *Same Pair*\n\n"
+            f"📡 *Currently watching:* {active_text}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "*Entry Types:*\n"
+            "  ⚡ *ENTER NOW* — Pre-close alert (40–55s mark)\n"
+            "    Enter immediately, candle closing\n"
+            "  ⏱ *NEXT CANDLE* — Pattern confirmed on close\n"
+            "    Enter at open of the next candle\n\n"
+            "_Minimum confidence: 62%_\n"
+            "_Only high-confluence setups are sent._"
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+    async def cmd_stats(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        self._ensure_state(chat_id)
+        s      = self.state.stats[chat_id]
+        active = self.state.active_pair.get(chat_id, "None")
+        total  = s["signals_sent"]
+
+        await update.message.reply_text(
+            f"📊 *Session Statistics*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📡 Active Pair:    `{active}`\n"
+            f"🔔 Signals Sent:   `{total}`\n"
+            f"📈 CALL Signals:   `{s['calls']}`\n"
+            f"📉 PUT Signals:    `{s['puts']}`\n\n"
+            f"_Stats reset each session._",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    async def cmd_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        self.state.paused.add(chat_id)
+        await update.message.reply_text(
+            "⏸ *Signals paused.*\n\n"
+            "_Tap Resume to restart and pick a pair._",
+            reply_markup=build_paused_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    async def cmd_resume(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        self.state.paused.discard(chat_id)
+        await update.message.reply_text(
+            "▶️ *Signals resumed!*\n\n"
+            "_Pick a pair to start scanning:_",
+            reply_markup=build_category_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    # ── CALLBACK HANDLER ─────────────────────────────────────────────────────
+
+    async def handle_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        query   = update.callback_query
+        await query.answer()
+        data    = query.data
+        chat_id = update.effective_chat.id
+        self._ensure_state(chat_id)
+
+        try:
+            await self._dispatch_callback(query, data, chat_id, ctx)
+        except Exception as e:
+            logger.error(f"Callback error [{data}] chat={chat_id}: {e}")
+
+    async def _dispatch_callback(self, query, data: str, chat_id: int, ctx):
+        """
+        All tap actions route through here.
+
+        cat_menu          → show category selector
+        cat_{id}          → show pairs for that category
+        pair_{symbol}     → select pair, run immediate analysis
+        change_pair       → show category selector (from post-signal toggle)
+        same_pair         → re-analyse the current active pair immediately
+        resume_pick       → unpause + show category selector
+        """
+
+        # ── CATEGORY MENU ────────────────────────────────────────────────────
+        if data == "cat_menu":
+            await query.edit_message_text(
+                self.formatter.category_menu_text(),
+                reply_markup=build_category_keyboard(),
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+        # ── CATEGORY SELECTED → show pairs ───────────────────────────────────
+        elif data.startswith("cat_"):
+            cat_id = data[4:]
+            if cat_id not in _CAT_BY_ID:
+                return
+            icon, label, syms, cols = _CAT_BY_ID[cat_id]
+            await query.edit_message_text(
+                self.formatter.pairs_menu_text(icon, label, len(syms)),
+                reply_markup=build_pairs_keyboard(cat_id),
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+        # ── PAIR SELECTED → set active, run immediate analysis ───────────────
+        elif data.startswith("pair_"):
+            symbol = data[5:]
+            await self._select_pair_and_analyse(query, chat_id, symbol, ctx)
+
+        # ── CHANGE PAIR (post-signal toggle) → category selector ─────────────
+        elif data == "change_pair":
+            await query.edit_message_text(
+                self.formatter.category_menu_text(),
+                reply_markup=build_category_keyboard(),
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+        # ── SAME PAIR (post-signal toggle) → re-analyse immediately ──────────
+        elif data == "same_pair":
+            symbol = self.state.active_pair.get(chat_id)
+            if not symbol:
+                # Somehow no active pair — send them back to selector
+                await query.edit_message_text(
+                    "⚠️ No active pair found.\n_Pick a pair to continue:_",
+                    reply_markup=build_category_keyboard(),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            # Show scanning indicator on the toggle message, then send new signal
+            await query.edit_message_text(
+                f"⏳ *Re-scanning `{symbol}`...*",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            await self._run_analysis_and_send(chat_id, symbol, ctx.bot)
+
+        # ── RESUME + PICK PAIR ────────────────────────────────────────────────
+        elif data == "resume_pick":
+            self.state.paused.discard(chat_id)
+            await query.edit_message_text(
+                "▶️ *Resumed!*\n\n_Pick a pair to start scanning:_",
+                reply_markup=build_category_keyboard(),
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+    # ── PAIR SELECTION FLOW ───────────────────────────────────────────────────
+
+    async def _select_pair_and_analyse(
+        self,
+        query,
+        chat_id: int,
+        symbol:  str,
+        ctx:     ContextTypes.DEFAULT_TYPE
+    ):
+        """
+        Called when user taps a pair button.
+        1. Set as active pair
+        2. Show "Analysing..." in the menu message
+        3. Run analysis
+        4. Send signal (or no-signal) as new message with post-signal toggle
+        5. Start / restart the 60s auto-scan job
+        """
+        self.state.active_pair[chat_id] = symbol
+        self.state.paused.discard(chat_id)
+
+        # Show scanning indicator in the menu message
+        await query.edit_message_text(
+            f"⏳ *Analysing `{symbol}`...*\n"
+            f"_Scanning M1 candles — please wait_",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+        # Run analysis and send result
+        await self._run_analysis_and_send(chat_id, symbol, ctx.bot)
+
+        # Start repeating auto-scan (fires 60s later, not immediately)
+        self._start_scan_job(ctx, chat_id)
+
+    async def _run_analysis_and_send(self, chat_id: int, symbol: str, bot):
+        """
+        Core: analyse one symbol and send the result to the chat.
+        Always attaches the post-signal toggle keyboard.
+        """
+        signal  = await self._analyse_asset(symbol)
+        elapsed = await self.feed.get_current_seconds_into_minute()
+
+        if signal:
+            self._record_stat(chat_id, signal)
+            try:
+                await bot.send_message(
+                    chat_id    = chat_id,
+                    text       = self.formatter.signal_message(signal, elapsed),
+                    parse_mode = ParseMode.MARKDOWN,
+                    reply_markup = build_post_signal_keyboard()
+                )
+            except Exception as e:
+                logger.error(f"Send signal error to {chat_id}: {e}")
+        else:
+            try:
+                await bot.send_message(
+                    chat_id    = chat_id,
+                    text       = self.formatter.no_signal_message(symbol),
+                    parse_mode = ParseMode.MARKDOWN,
+                    reply_markup = build_post_signal_keyboard()
+                )
+            except Exception as e:
+                logger.error(f"Send no-signal error to {chat_id}: {e}")
+
+    # ── AUTO-SCAN JOB ─────────────────────────────────────────────────────────
+
+    async def _auto_scan_job(self, ctx: ContextTypes.DEFAULT_TYPE):
+        """
+        Background repeating job — fires every SCAN_INTERVAL seconds.
+        Scans the user's single active pair only.
+        """
+        chat_id = ctx.job.data["chat_id"]
+
+        if chat_id in self.state.paused:
+            return
+
+        symbol = self.state.active_pair.get(chat_id)
+        if not symbol:
+            return
+
+        signal  = await self._analyse_asset(symbol)
+        elapsed = await self.feed.get_current_seconds_into_minute()
+
+        if signal:
+            self._record_stat(chat_id, signal)
+            try:
+                await ctx.bot.send_message(
+                    chat_id      = chat_id,
+                    text         = self.formatter.signal_message(signal, elapsed),
+                    parse_mode   = ParseMode.MARKDOWN,
+                    reply_markup = build_post_signal_keyboard()
+                )
+            except Exception as e:
+                logger.error(f"Auto-scan send error to {chat_id}: {e}")
+        # No signal on auto-scan = silent (don't flood with no-signal messages)
+
+    # ── CORE ANALYSIS PIPELINE ────────────────────────────────────────────────
+
+    async def _analyse_asset(self, symbol: str) -> Optional[FinalSignal]:
+        """Full pipeline: resolve symbol → fetch candles → analyse → return signal."""
+        try:
+            fetch_symbol = resolve_symbol(symbol)
+
+            raw_candles = await self.feed.fetch_candles(
+                fetch_symbol, interval="1min", count=60
+            )
+            if len(raw_candles) < 10:
+                return None
+
+            candles = [
+                Candle(
+                    open   = c["open"],
+                    high   = c["high"],
+                    low    = c["low"],
+                    close  = c["close"],
+                    volume = c.get("volume", 0.0)
+                )
+                for c in raw_candles
+            ]
+
+            raw_forming = await self.feed.fetch_live_quote(fetch_symbol)
+            forming = Candle(
+                open   = raw_forming["open"],
+                high   = raw_forming["high"],
+                low    = raw_forming["low"],
+                close  = raw_forming["close"],
+                volume = raw_forming.get("volume", 0.0)
+            ) if raw_forming else None
+
+            elapsed = await self.feed.get_current_seconds_into_minute()
+            ts      = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+            return self.engine.evaluate(
+                asset           = symbol,
+                candles         = candles,
+                forming_candle  = forming,
+                elapsed_seconds = elapsed,
+                timestamp       = ts
+            )
+
+        except Exception as e:
+            logger.error(f"Analysis error [{symbol}]: {e}")
+            return None
+
+    # ── RUN ───────────────────────────────────────────────────────────────────
+
+    async def run(self):
+        logger.info("🤖 Binary Signal Robot v2.0 starting...")
+        try:
+            await self.app.initialize()
+            await self.app.start()
+            await self.app.updater.start_polling(drop_pending_updates=True)
+            logger.info("🚀 Bot is live — waiting for commands...")
+            await asyncio.Event().wait()   # Run forever
+        finally:
+            try:
+                await self.app.updater.stop()
+                await self.app.stop()
+                await self.app.shutdown()
+            except Exception:
+                pass
+            await self.feed.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    TWELVE_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
+
+    if not TELEGRAM_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN not set in .env")
+    if not TWELVE_API_KEY:
+        raise ValueError("TWELVE_DATA_API_KEY not set in .env")
+
+    bot = BinarySignalBot(TELEGRAM_TOKEN, TWELVE_API_KEY)
+    asyncio.run(bot.run())
+
+
+
+"""
+╔══════════════════════════════════════════════════════════════╗
+║         data_feed.py — TWELVE DATA FEED                      ║
+║   Verified against Twelve Data API response format           ║
+║                                                              ║
+║   KEY FACTS (from API docs):                                 ║
+║   • All OHLCV fields come back as STRINGS — must cast        ║
+║   • Values array is DESCENDING (newest first) — must flip    ║
+║   • Forex volume = tick count (not real lot volume)          ║
+║   • Volume field absent on some exotic pairs — handled       ║
+║   • Quote endpoint returns float strings for live candle     ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+
+import asyncio
+import logging
+import time
+from datetime import datetime, timezone
+from typing import Optional
+import aiohttp
+
+logger = logging.getLogger("DataFeed")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ASSET CATALOGUE
+# ─────────────────────────────────────────────────────────────────────────────
+
+ASSET_CATALOGUE = {
+    "Forex": {
+        "EUR/USD": {"name": "Euro / US Dollar",            "type": "forex"},
+        "GBP/USD": {"name": "British Pound / US Dollar",   "type": "forex"},
+        "USD/JPY": {"name": "US Dollar / Japanese Yen",    "type": "forex"},
+        "AUD/USD": {"name": "Australian Dollar / USD",     "type": "forex"},
+        "USD/CAD": {"name": "US Dollar / Canadian Dollar", "type": "forex"},
+        "USD/CHF": {"name": "US Dollar / Swiss Franc",     "type": "forex"},
+        "EUR/JPY": {"name": "Euro / Japanese Yen",         "type": "forex"},
+        "EUR/GBP": {"name": "Euro / British Pound",        "type": "forex"},
+        "GBP/JPY": {"name": "British Pound / Japanese Yen","type": "forex"},
+        "NZD/USD": {"name": "New Zealand Dollar / USD",    "type": "forex"},
+        "EUR/AUD": {"name": "Euro / Australian Dollar",    "type": "forex"},
+        "AUD/JPY": {"name": "Australian Dollar / JPY",     "type": "forex"},
+    },
+    "Crypto": {
+        "BTC/USD": {"name": "Bitcoin / US Dollar",         "type": "crypto"},
+        "ETH/USD": {"name": "Ethereum / US Dollar",        "type": "crypto"},
+        "BNB/USD": {"name": "Binance Coin / US Dollar",    "type": "crypto"},
+        "SOL/USD": {"name": "Solana / US Dollar",          "type": "crypto"},
+        "XRP/USD": {"name": "Ripple / US Dollar",          "type": "crypto"},
+    },
+    "Commodities": {
+        "XAU/USD": {"name": "Gold / US Dollar",            "type": "commodity"},
+        "XAG/USD": {"name": "Silver / US Dollar",          "type": "commodity"},
+        "USOIL":   {"name": "US Crude Oil (WTI)",          "type": "commodity"},
+        "UKOIL":   {"name": "UK Crude Oil (Brent)",        "type": "commodity"},
+    },
+    "Indices": {
+        "SPX":     {"name": "S&P 500 Index",               "type": "index"},
+        "NDX":     {"name": "NASDAQ 100 Index",            "type": "index"},
+        "DJI":     {"name": "Dow Jones Industrial",        "type": "index"},
+        "FTSE":    {"name": "FTSE 100 Index",              "type": "index"},
+        "DAX":     {"name": "DAX 40 Index",                "type": "index"},
+    },
+    "Stocks": {
+        "AAPL":    {"name": "Apple Inc.",                  "type": "stock"},
+        "TSLA":    {"name": "Tesla Inc.",                  "type": "stock"},
+        "NVDA":    {"name": "NVIDIA Corporation",          "type": "stock"},
+        "MSFT":    {"name": "Microsoft Corporation",       "type": "stock"},
+        "META":    {"name": "Meta Platforms Inc.",         "type": "stock"},
+        "AMZN":    {"name": "Amazon.com Inc.",             "type": "stock"},
+        "GOOGL":   {"name": "Alphabet Inc.",               "type": "stock"},
+    },
+}
+
+
+def find_asset(symbol: str) -> Optional[dict]:
+    """Find an asset across all categories. Returns asset info dict or None."""
+    for category, assets in ASSET_CATALOGUE.items():
+        if symbol in assets:
+            return {**assets[symbol], "category": category}
+    return None
+
+
+def get_category(symbol: str) -> Optional[str]:
+    """Return the category name for a symbol."""
+    for category, assets in ASSET_CATALOGUE.items():
+        if symbol in assets:
+            return category
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VOLUME HANDLING CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Asset types where Twelve Data returns REAL volume (not tick count)
+REAL_VOLUME_TYPES = {"stock", "index", "crypto", "commodity"}
+
+# Asset types where volume = tick count (still valid for spike detection)
+TICK_VOLUME_TYPES = {"forex"}
+
+# Fallback volume if the field is missing or zero for too many candles
+VOLUME_FALLBACK = 1.0
+
+# Minimum non-zero volume candles required before volume analysis is trusted
+MIN_VOLUME_CANDLES = 10
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CANDLE PARSER — handles Twelve Data's string-typed fields
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _safe_float(value, fallback: float = 0.0) -> float:
+    """
+    Safely cast a Twelve Data field value to float.
+    API returns all OHLCV values as strings — this handles:
+      "148.372"  → 148.372
+      None       → fallback
+      ""         → fallback
+      "N/A"      → fallback
+    """
+    if value is None:
+        return fallback
+    try:
+        result = float(str(value).strip())
+        return result if result == result else fallback  # NaN guard
+    except (ValueError, TypeError):
+        return fallback
+
+
+def _parse_candle(raw: dict, symbol: str = "") -> dict:
+    """
+    Parse a single Twelve Data candle from the 'values' array.
+
+    Raw format (all strings):
+    {
+        "datetime": "2021-08-26 15:59:00",
+        "open":     "148.372",
+        "high":     "148.405",
+        "low":      "148.365",
+        "close":    "148.390",
+        "volume":   "2206"        ← string, may be "0" or absent for forex
+    }
+
+    Returns a properly typed dict with a guaranteed 'volume' float key.
+    """
+    volume_raw = raw.get("volume")
+
+    # Volume handling:
+    # - Forex pairs: "0" is common (tick volume not always provided)
+    # - Missing key: treat as 0 and let the engine handle gracefully
+    volume = _safe_float(volume_raw, fallback=VOLUME_FALLBACK)
+
+    return {
+        "datetime": raw.get("datetime", ""),
+        "open":     _safe_float(raw.get("open")),
+        "high":     _safe_float(raw.get("high")),
+        "low":      _safe_float(raw.get("low")),
+        "close":    _safe_float(raw.get("close")),
+        "volume":   volume,
+    }
+
+
+def _parse_candles(values: list, symbol: str = "") -> list:
+    """
+    Parse and order a full candle list from Twelve Data.
+
+    Twelve Data returns values in DESCENDING order (newest first).
+    We reverse to ascending (oldest first) for correct EMA/analysis.
+    """
+    parsed = [_parse_candle(c, symbol) for c in values]
+    parsed.reverse()   # ascending: oldest → newest
+    return parsed
+
+
+def _assess_volume_quality(candles: list) -> dict:
+    """
+    Analyse the quality of volume data in a candle set.
+
+    Returns a dict with:
+      - has_volume:    bool — enough non-zero volume for spike analysis
+      - zero_pct:      float — percentage of candles with zero volume
+      - avg_volume:    float — mean of non-zero volumes
+      - recommendation: str — human-readable quality note
+    """
+    volumes = [c["volume"] for c in candles]
+    non_zero = [v for v in volumes if v > 0]
+    zero_pct = (len(volumes) - len(non_zero)) / max(len(volumes), 1) * 100
+
+    has_volume = len(non_zero) >= MIN_VOLUME_CANDLES
+    avg_volume = sum(non_zero) / len(non_zero) if non_zero else 0.0
+
+    if zero_pct >= 80:
+        rec = "Volume unavailable for this asset — spike analysis disabled"
+    elif zero_pct >= 40:
+        rec = "Sparse volume data — spike signals may be unreliable"
+    else:
+        rec = "Volume data adequate for spike analysis"
+
+    return {
+        "has_volume":      has_volume,
+        "zero_pct":        zero_pct,
+        "avg_volume":      avg_volume,
+        "recommendation":  rec,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TWELVE DATA FEED
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TwelveDataFeed:
+    """
+    Async HTTP client for Twelve Data API.
+
+    Provides:
+      fetch_candles()      — closed M1 candles with volume, ascending order
+      fetch_live_quote()   — forming (live) candle from /quote endpoint
+      get_current_seconds_into_minute() — timing for pre-close detection
+      validate_api_key()   — startup health check
+    """
+
+    BASE_URL = "https://api.twelvedata.com"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=10)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    # ── CANDLE FETCH ──────────────────────────────────────────────────────────
+
+    async def fetch_candles(
+        self,
+        symbol:   str,
+        interval: str = "1min",
+        count:    int = 60,
+    ) -> list:
+        """
+        Fetch `count` closed M1 candles for `symbol`.
+
+        Returns a list of candle dicts ordered oldest→newest:
+        [
+            {"datetime": ..., "open": float, "high": float,
+             "low": float, "close": float, "volume": float},
+            ...
+        ]
+
+        Volume notes:
+        - Stocks/Crypto/Commodities: real traded volume (float)
+        - Forex: tick volume (number of price ticks per minute)
+        - Both are valid for relative spike detection in CRT analysis
+        - Volume "0" values are preserved (engine handles gracefully)
+        """
+        session = await self._get_session()
+
+        params = {
+            "symbol":     symbol,
+            "interval":   interval,
+            "outputsize": count,
+            "apikey":     self.api_key,
+            "order":      "desc",   # newest first (we reverse after parsing)
+            "format":     "JSON",
+        }
+
+        try:
+            async with session.get(f"{self.BASE_URL}/time_series", params=params) as resp:
+                if resp.status != 200:
+                    logger.error(f"[{symbol}] HTTP {resp.status} from Twelve Data")
+                    return []
+
+                data = await resp.json()
+
+                # API-level error check
+                if data.get("status") == "error":
+                    msg = data.get("message", "Unknown error")
+                    logger.error(f"[{symbol}] Twelve Data error: {msg}")
+                    return []
+
+                values = data.get("values", [])
+                if not values:
+                    logger.warning(f"[{symbol}] No candle data returned")
+                    return []
+
+                # Parse with type coercion + ascending sort
+                candles = _parse_candles(values, symbol)
+
+                # Log volume quality for diagnostics
+                vq = _assess_volume_quality(candles)
+                if vq["zero_pct"] > 40:
+                    logger.warning(
+                        f"[{symbol}] Volume quality: {vq['zero_pct']:.0f}% zero — "
+                        f"{vq['recommendation']}"
+                    )
+                else:
+                    logger.debug(
+                        f"[{symbol}] Volume quality OK — avg={vq['avg_volume']:.0f}, "
+                        f"zero={vq['zero_pct']:.0f}%"
+                    )
+
+                return candles
+
+        except asyncio.TimeoutError:
+            logger.error(f"[{symbol}] Timeout fetching candles")
+            return []
+        except Exception as e:
+            logger.error(f"[{symbol}] fetch_candles error: {e}")
+            return []
+
+    # ── LIVE QUOTE (FORMING CANDLE) ───────────────────────────────────────────
+
+    async def fetch_live_quote(self, symbol: str) -> Optional[dict]:
+        """
+        Fetch the current live/forming candle from the /quote endpoint.
+
+        Twelve Data /quote returns the CURRENT open candle, giving us
+        a real-time snapshot for pre-close analysis.
+
+        Returns a candle dict with volume (may be partial — that's expected).
+        """
+        session = await self._get_session()
+
+        params = {
+            "symbol": symbol,
+            "apikey": self.api_key,
+        }
+
+        try:
+            async with session.get(f"{self.BASE_URL}/quote", params=params) as resp:
+                if resp.status != 200:
+                    logger.error(f"[{symbol}] HTTP {resp.status} from /quote")
+                    return None
+
+                data = await resp.json()
+
+                if data.get("status") == "error":
+                    logger.error(f"[{symbol}] Quote error: {data.get('message')}")
+                    return None
+
+                # /quote response uses same field names — all strings
+                # Fields: open, high, low, close, volume, previous_close, etc.
+                return {
+                    "datetime": data.get("datetime", ""),
+                    "open":     _safe_float(data.get("open")),
+                    "high":     _safe_float(data.get("high")),
+                    "low":      _safe_float(data.get("low")),
+                    "close":    _safe_float(data.get("close")),
+                    "volume":   _safe_float(data.get("volume"), fallback=VOLUME_FALLBACK),
+                }
+
+        except asyncio.TimeoutError:
+            logger.error(f"[{symbol}] Timeout on /quote")
+            return None
+        except Exception as e:
+            logger.error(f"[{symbol}] fetch_live_quote error: {e}")
+            return None
+
+    # ── TIMING ────────────────────────────────────────────────────────────────
+
+    async def get_current_seconds_into_minute(self) -> int:
+        """
+        Returns how many seconds into the current minute we are (0–59).
+        Used by the CRT engine's pre-close detection (40–55s window).
+
+        Based on UTC time to match Twelve Data's candle timestamps.
+        """
+        return datetime.now(timezone.utc).second
+
+    # ── API KEY VALIDATION ────────────────────────────────────────────────────
+
+    async def validate_api_key(self) -> str:
+        """
+        Validate the API key by hitting the /api_usage endpoint.
+
+        Returns one of three strings:
+          "ok"           — key is valid and has credits available
+          "rate_limited" — key is valid but hit per-minute credit cap
+                           (common on free tier if bot ran recently)
+          "invalid"      — key is wrong, expired, or not recognised
+        """
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{self.BASE_URL}/api_usage",
+                params={"apikey": self.api_key}
+            ) as resp:
+                data = await resp.json()
+
+                # HTTP 200 + status ok = all good
+                if resp.status == 200 and data.get("status") == "ok":
+                    return "ok"
+
+                # Rate limit message — key is valid, just throttled
+                message = data.get("message", "") or data.get("code", "")
+                if "run out of API credits" in str(message) or "429" in str(resp.status):
+                    logger.warning(f"API key validation: rate limited — {message}")
+                    return "rate_limited"
+
+                # Anything else (401, wrong key, etc.) = invalid
+                logger.error(f"API key validation failed: {message}")
+                return "invalid"
+
+        except Exception as e:
+            logger.error(f"API key validation error: {e}")
+            # Network error — assume rate limited not invalid (safer default)
+            return "rate_limited"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VOLUME QUALITY CHECKER — call this at startup to verify your data
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def check_volume_availability(
+    feed:    TwelveDataFeed,
+    symbols: list[str],
+) -> dict[str, dict]:
+    """
+    Run a volume quality check across a list of symbols at startup.
+
+    Usage in bot.py:
+        report = await check_volume_availability(self.feed, ["EUR/USD", "BTC/USD", ...])
+        for symbol, info in report.items():
+            logger.info(f"{symbol}: {info['recommendation']}")
+
+    Returns a dict of symbol → volume quality info.
+    """
+    results = {}
+    for symbol in symbols:
+        candles = await feed.fetch_candles(symbol, count=20)
+        if candles:
+            results[symbol] = _assess_volume_quality(candles)
+        else:
+            results[symbol] = {
+                "has_volume":      False,
+                "zero_pct":        100.0,
+                "avg_volume":      0.0,
+                "recommendation":  "Could not fetch candles",
+            }
+    return results
+
+
+
+ENV
+# ════════════════════════════════════════════════════════════
+#   Binary Signal Robot — Environment Configuration
+# ════════════════════════════════════════════════════════════
+
+# ── Telegram Bot Token ───────────────────────────────────────
+# Get this from @BotFather on Telegram
+TELEGRAM_BOT_TOKEN=8640249353:AAFEVZUJO_Gy4uF9UvU41etO02TLq4qdL-I
+
+# ── Twelve Data API Key ──────────────────────────────────────
+# Get a FREE key at: https://twelvedata.com/account/api-keys
+# Free tier: 8 API calls/minute, 800/day — sufficient for 4-5 assets
+# Grow plan ($29/mo): 55 calls/min — ideal for full watchlists
+TWELVE_DATA_API_KEY=35a5d40cd7174bf7b7c958cf05c57d4b
+
+ALLOWED_USER_ID=131616771
+
+
+
+SSID=42["auth",{"session":"a:4:{s:10:\"session_id\";s:32:\"6992d3235a4e8f99d706bed2bd1ecd83\";s:10:\"ip_address\";s:13:\"186.45.241.57\";s:10:\"user_agent\";s:111:\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36\";s:13:\"last_activity\";i:1778035963;}c11bf9b413fcb506a9e23f8f0dba925c","isDemo":0,"uid":104826667,"platform":2,"isFastHistory":true,"isOptimized":true}] 
+
+
+
+
+
+"""
+╔══════════════════════════════════════════════════════════════╗
+║              CONFLUENCE & SIGNAL ENGINE  v2.0                ║
+║   Combines candle psychology + EMA + S/R + CRT + Volume      ║
+║   + RSI + ATR + Momentum + Session + Cooldown                ║
+║   to produce high-accuracy binary signals                    ║
+║                                                              ║
+║   CHANGES FROM v1.0:                                         ║
+║   [NEW] filters.py accuracy layer integrated                 ║
+║         → RSI overbought/oversold guard                      ║
+║         → ATR dead-market / news-spike guard                 ║
+║         → Momentum consistency score                         ║
+║         → Session quality weighting (OTC-aware)              ║
+║         → Signal cooldown per asset (prevents chasing)       ║
+║   [NEW] _get_asset_type() helper for automatic filter routing║
+║   [NEW] cooldown.record() called on every emitted signal     ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+
+from dataclasses import dataclass, field
+from typing import Optional
+from candle_psychology import Candle, CandleSignal, CandlePsychologyEngine
+from crt_volume_engine import CRTVolumeEngine
+
+# ── NEW IMPORT ─────────────────────────────────────────────────────────────
+# filters.py must sit in the same directory as signal_engine.py
+from filters import run_all_filters, SignalCooldownTracker
+# ──────────────────────────────────────────────────────────────────────────
+
+import statistics
+
+
+@dataclass
+class TechnicalLevels:
+    ema_9: float = 0.0
+    ema_21: float = 0.0
+    ema_50: float = 0.0
+    support_levels: list = field(default_factory=list)
+    resistance_levels: list = field(default_factory=list)
+    trend: str = "SIDEWAYS"   # BULLISH | BEARISH | SIDEWAYS
+
+
+@dataclass
+class FinalSignal:
+    asset: str
+    direction: str              # CALL | PUT
+    confidence: int             # 0-100
+    candle_pattern: str
+    candle_description: str
+    candle_emoji: str
+    confluence_factors: list    # list of strings explaining why
+    entry_note: str
+    expiry: str = "1 MINUTE"
+    timestamp: str = ""
+    pre_close: bool = False     # True if signal fired before candle closed
+
+
+class ConfluenceEngine:
+    """
+    Combines four layers:
+      Layer 1 — Candle Psychology  (patterns, pin bars, engulfing etc.)
+      Layer 2 — EMA + S/R levels  (trend alignment, key level proximity)
+      Layer 3 — CRT + Volume      (sweep detection, volume spike, rejection)
+      Layer 4 — Accuracy Filters  (RSI, ATR, Momentum, Session, Cooldown)  ← NEW
+
+    All layers must agree on direction for highest confidence.
+    Conflict between layers suppresses the signal.
+    """
+
+    SIGNAL_THRESHOLD = 62
+
+    def __init__(self):
+        self.psychology = CandlePsychologyEngine()
+        self.crt        = CRTVolumeEngine(min_confidence=55)
+
+        # ── NEW: Accuracy filter suite ──────────────────────────────────────
+        # One cooldown tracker lives on the engine — it persists across all
+        # evaluate() calls for the lifetime of the bot, giving it the full
+        # history it needs to detect chasing across candles.
+        self.cooldown = SignalCooldownTracker()
+        # ────────────────────────────────────────────────────────────────────
+
+    # ── NEW HELPER: resolve asset type for session / filter routing ──────────
+    def _get_asset_type(self, asset: str) -> str:
+        """
+        Infer asset type from the symbol name so filters can apply the right
+        session windows and OTC-tolerances without needing a catalogue lookup.
+
+        Covers all assets in ASSET_CATALOGUE + OTC variants.
+        """
+        # Strip OTC suffix before classification
+        base = asset.replace("-OTC", "").upper()
+
+        # Crypto identifiers
+        if any(k in base for k in ["BTC", "ETH", "BNB", "SOL", "XRP"]):
+            return "crypto"
+
+        # Commodity identifiers
+        if any(k in base for k in ["XAU", "XAG", "GOLD", "SILVER", "OIL", "USOIL", "UKOIL"]):
+            return "commodity"
+
+        # Index identifiers
+        if any(k in base for k in ["SPX", "NDX", "DJI", "FTSE", "DAX", "NAS", "SP500"]):
+            return "index"
+
+        # Stock identifiers — uppercase single-word tickers without "/"
+        if "/" not in base and len(base) <= 5 and base.isalpha():
+            return "stock"
+
+        # Everything else with a "/" is forex (EUR/USD, GBP/JPY etc.)
+        return "forex"
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def calculate_ema(self, prices: list, period: int) -> float:
+        if len(prices) < period:
+            return prices[-1] if prices else 0.0
+        k = 2 / (period + 1)
+        ema = statistics.mean(prices[:period])
+        for price in prices[period:]:
+            ema = price * k + ema * (1 - k)
+        return ema
+
+    def get_levels(self, candles: list) -> TechnicalLevels:
+        if not candles:
+            return TechnicalLevels()
+
+        closes = [c.close for c in candles]
+        highs  = [c.high  for c in candles]
+        lows   = [c.low   for c in candles]
+
+        ema9  = self.calculate_ema(closes, 9)
+        ema21 = self.calculate_ema(closes, 21)
+        ema50 = self.calculate_ema(closes, min(50, len(closes)))
+
+        resistance = sorted(set(round(h, 5) for h in sorted(highs)[-10:]))
+        support    = sorted(set(round(l, 5) for l in sorted(lows)[:10]))
+
+        if ema9 > ema21 > ema50:
+            trend = "BULLISH"
+        elif ema9 < ema21 < ema50:
+            trend = "BEARISH"
+        else:
+            trend = "SIDEWAYS"
+
+        return TechnicalLevels(
+            ema_9=ema9, ema_21=ema21, ema_50=ema50,
+            support_levels=support, resistance_levels=resistance, trend=trend
+        )
+
+    def at_key_level(self, price: float, levels: TechnicalLevels) -> tuple:
+        tolerance = price * 0.0008
+        for r in levels.resistance_levels:
+            if abs(price - r) <= tolerance:
+                return True, f"At Resistance ({r:.5f})"
+        for s in levels.support_levels:
+            if abs(price - s) <= tolerance:
+                return True, f"At Support ({s:.5f})"
+        for ema_val, ema_name in [
+            (levels.ema_9, "EMA 9"),
+            (levels.ema_21, "EMA 21"),
+            (levels.ema_50, "EMA 50")
+        ]:
+            if abs(price - ema_val) <= tolerance * 2:
+                return True, f"At {ema_name} ({ema_val:.5f})"
+        return False, ""
+
+    def _candles_to_dicts(self, candles: list) -> list:
+        """Convert Candle objects to dicts for the CRT engine and filters."""
+        return [
+            {
+                "open":   c.open,
+                "high":   c.high,
+                "low":    c.low,
+                "close":  c.close,
+                "volume": c.volume,
+            }
+            for c in candles
+        ]
+
+    def evaluate(
+        self,
+        asset: str,
+        candles: list,
+        forming_candle: Optional[Candle] = None,
+        elapsed_seconds: float = 0.0,
+        timestamp: str = ""
+    ) -> Optional[FinalSignal]:
+
+        if len(candles) < 5:
+            return None
+
+        levels  = self.get_levels(candles)
+        current = candles[-1]
+
+        # ── Layer 1: Candle Psychology ────────────────────────────────────────
+        candle_sig = self.psychology.analyse(candles[-5:])
+        pre_close  = False
+
+        if forming_candle and elapsed_seconds >= 40:
+            live_sig = self.psychology.predict_forming_candle(forming_candle, elapsed_seconds)
+            if live_sig and (candle_sig is None or
+                             live_sig.confidence > candle_sig.confidence * 0.85):
+                candle_sig = live_sig
+                pre_close  = True
+
+        # ── Layer 2: CRT + Volume ─────────────────────────────────────────────
+        candle_dicts = self._candles_to_dicts(candles)
+        forming_dict = {
+            "open": forming_candle.open, "high": forming_candle.high,
+            "low":  forming_candle.low,  "close": forming_candle.close,
+            "volume": forming_candle.volume
+        } if forming_candle else None
+
+        crt_sig = self.crt.analyse(
+            asset           = asset,
+            candles         = candle_dicts,
+            forming_candle  = forming_dict,
+            elapsed_seconds = int(elapsed_seconds),
+        )
+
+        # ── Layer 3: Direction conflict check ─────────────────────────────────
+        if candle_sig and crt_sig:
+            if candle_sig.direction != crt_sig.direction:
+                return None   # Layers conflict — skip this candle
+
+        if candle_sig is None and crt_sig is None:
+            return None
+
+        lead_direction = (candle_sig.direction if candle_sig
+                          else crt_sig.direction)
+
+        # ── Confluence scoring ────────────────────────────────────────────────
+        confluence = []
+        boost      = 0.0
+
+        if lead_direction == "CALL" and levels.trend == "BULLISH":
+            confluence.append("✅ EMA trend aligns BULLISH (9 > 21 > 50)")
+            boost += 0.08
+        elif lead_direction == "PUT" and levels.trend == "BEARISH":
+            confluence.append("✅ EMA trend aligns BEARISH (9 < 21 < 50)")
+            boost += 0.08
+        elif levels.trend == "SIDEWAYS":
+            confluence.append("⚠️ Sideways trend — lower reliability")
+            boost -= 0.04
+        else:
+            confluence.append("❌ Counter-trend signal — use caution")
+            boost -= 0.10
+
+        if levels.ema_9 != 0 and levels.ema_21 != 0:
+            gap = abs(levels.ema_9 - levels.ema_21) / current.close * 100
+            if gap > 0.05:
+                confluence.append(f"✅ EMA spread {gap:.3f}% — trending momentum")
+                boost += 0.04
+            else:
+                confluence.append(f"⚠️ EMAs flat ({gap:.3f}%) — choppy market")
+                boost -= 0.02
+
+        at_level, level_desc = self.at_key_level(current.close, levels)
+        if at_level:
+            confluence.append(f"✅ {level_desc} — highest-probability zone")
+            boost += 0.12
+
+        if candle_sig and candle_sig.sub_patterns:
+            extras = ", ".join(candle_sig.sub_patterns)
+            confluence.append(f"✅ Confirmed by: {extras}")
+            boost += 0.05 * len(candle_sig.sub_patterns)
+
+        if current.body_ratio > 0.55:
+            confluence.append(f"✅ Strong candle body ({current.body_ratio:.0%}) — high conviction")
+            boost += 0.04
+        elif current.body_ratio < 0.20:
+            confluence.append("⚠️ Small candle body — weak conviction")
+            boost -= 0.03
+
+        if crt_sig:
+            confluence.append("━━━ CRT + VOLUME LAYER ━━━")
+            confluence.extend(crt_sig.confluence_factors)
+            crt_boost = (crt_sig.confidence / 100) * 0.15
+            boost += crt_boost
+
+        # ── Base confidence (pre-filter) ──────────────────────────────────────
+        base_conf = candle_sig.confidence if candle_sig else (crt_sig.confidence / 100)
+        raw       = base_conf + boost
+
+        # ═════════════════════════════════════════════════════════════════════
+        # ── Layer 4: ACCURACY FILTER SUITE  ── NEW BLOCK ─────────────────────
+        # ═════════════════════════════════════════════════════════════════════
+        #
+        # Run all five filters AFTER the core confluence layers.
+        # The filters adjust the raw confidence up or down and can suppress
+        # the signal entirely (e.g. dead market, extreme RSI, dead session).
+        #
+        # candle_dicts is already built above for the CRT engine — reuse it.
+        # closes is extracted from the Candle objects list.
+        # is_otc is detected from the asset name suffix.
+        #
+        is_otc     = asset.endswith("-OTC")
+        asset_type = self._get_asset_type(asset)
+        closes     = [c.close for c in candles]
+
+        filter_result = run_all_filters(
+            asset        = asset,
+            asset_type   = asset_type,
+            direction    = lead_direction,
+            candle_dicts = candle_dicts,
+            closes       = closes,
+            cooldown     = self.cooldown,
+            is_otc       = is_otc,
+        )
+
+        # Hard suppress — dead market, extreme RSI, news spike, dead session
+        if filter_result.suppress:
+            return None
+
+        # Apply filter delta to raw confidence
+        raw += filter_result.confidence_delta
+
+        # Append filter factors to confluence block (shows in Telegram message)
+        if filter_result.factors:
+            confluence.append("━━━ ACCURACY FILTERS ━━━")
+            confluence.extend(filter_result.factors)
+        # ═════════════════════════════════════════════════════════════════════
+
+        # ── Final confidence gate ─────────────────────────────────────────────
+        final_pct = int(max(0, min(raw, 0.97)) * 100)
+
+        # ── Smart Expiry Calculation ────────────────────────────
+        ema_gap = abs(levels.ema_9 - levels.ema_21) / current.close * 100
+
+        expiry = self.determine_expiry(
+            confidence = final_pct,
+            trend      = levels.trend,
+            ema_gap    = ema_gap,
+            body_ratio = current.body_ratio,
+            crt_sig    = crt_sig,
+            pre_close  = pre_close,
+            is_otc     = is_otc
+        )
+
+        if final_pct < self.SIGNAL_THRESHOLD:
+            return None
+
+        # ── Pattern label ─────────────────────────────────────────────────────
+        if candle_sig and crt_sig:
+            pattern     = f"{candle_sig.pattern} + CRT {crt_sig.sweep_side.replace('_', ' ').title()}"
+            description = candle_sig.description
+            emoji       = candle_sig.emoji + " 📐"
+        elif crt_sig:
+            pattern     = f"CRT {crt_sig.sweep_side.replace('_', ' ').title()}"
+            description = (f"CRT sweep detected — Vol spike {crt_sig.volume.volume_ratio:.1f}x | "
+                           f"Range: {crt_sig.zone.range_low:.5f}–{crt_sig.zone.range_high:.5f}")
+            emoji       = "📐⚡"
+        else:
+            pattern     = candle_sig.pattern
+            description = candle_sig.description
+            emoji       = candle_sig.emoji
+
+        # ── Entry note ────────────────────────────────────────────────────────
+        if pre_close:
+            entry_note = f"⚡ PRE-CLOSE ALERT at {elapsed_seconds:.0f}s — Enter NOW on next candle open"
+        else:
+            entry_note = "Enter at open of NEXT candle after current closes"
+
+        # ── Build final signal ────────────────────────────────────────────────
+        signal = FinalSignal(
+            asset=asset,
+            direction=lead_direction,
+            confidence=final_pct,
+            candle_pattern=pattern,
+            candle_description=description,
+            candle_emoji=emoji,
+            confluence_factors=confluence,
+            entry_note=entry_note,
+            expiry=expiry,
+            timestamp=timestamp,
+            pre_close=pre_close
+        )
+
+        # ── NEW: Record cooldown AFTER signal is confirmed ────────────────────
+        # Called here so the cooldown tracker knows this asset/direction fired.
+        # Prevents chasing the same direction on the next candle scan.
+        self.cooldown.record(asset, lead_direction)
+        # ─────────────────────────────────────────────────────────────────────
+
+        return signal
+
+
+
+
+
+
+
+Signal Engine 2 for Stochastic Bot Implementation
+
+"""
+╔══════════════════════════════════════════════════════════════╗
+║              CONFLUENCE & SIGNAL ENGINE  v2.1                ║
+║   Combines candle psychology + EMA + S/R + CRT + Volume      ║
+║   + RSI + ATR + Momentum + Session + Cooldown                ║
+║   + Stochastic (10,3,5) + Session Label                      ║
+║   to produce high-accuracy binary signals                    ║
+║                                                              ║
+║   CHANGES FROM v2.0:                                         ║
+║   [NEW] calculate_stochastic(10, 3, 5)                       ║
+║         → Slow %K + %D confluence scoring                    ║
+║         → Oversold/overbought confirmation                   ║
+║         → %K/%D crossover bonus                              ║
+║   [NEW] _get_current_session()                               ║
+║         → Returns session label (London, NY, Asian etc.)     ║
+║         → Shown on FinalSignal.session field                 ║
+║   [NEW] FinalSignal.session field                            ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+
+from dataclasses import dataclass, field
+from typing import Optional
+from datetime import datetime, timezone
+from candle_psychology import Candle, CandleSignal, CandlePsychologyEngine
+from crt_volume_engine import CRTVolumeEngine
+
+# ── ACCURACY FILTER SUITE ──────────────────────────────────────────────────
+# filters.py must sit in the same directory as signal_engine.py
+from filters import run_all_filters, SignalCooldownTracker
+# ──────────────────────────────────────────────────────────────────────────
+
+import statistics
+
+
+@dataclass
+class TechnicalLevels:
+    ema_9: float = 0.0
+    ema_21: float = 0.0
+    ema_50: float = 0.0
+    support_levels: list = field(default_factory=list)
+    resistance_levels: list = field(default_factory=list)
+    trend: str = "SIDEWAYS"   # BULLISH | BEARISH | SIDEWAYS
+
+
+@dataclass
+class FinalSignal:
+    asset: str
+    direction: str              # CALL | PUT
+    confidence: int             # 0-100
+    candle_pattern: str
+    candle_description: str
+    candle_emoji: str
+    confluence_factors: list    # list of strings explaining why
+    entry_note: str
+    expiry: str = "1 MINUTE"
+    timestamp: str = ""
+    pre_close: bool = False     # True if signal fired before candle closed
+    session: str = ""           # e.g. "🇬🇧 London" — NEW in v2.1
+
+
+class ConfluenceEngine:
+    """
+    Combines five layers:
+      Layer 1 — Candle Psychology  (patterns, pin bars, engulfing etc.)
+      Layer 2 — EMA + S/R levels  (trend alignment, key level proximity)
+      Layer 3 — CRT + Volume      (sweep detection, volume spike, rejection)
+      Layer 4 — Accuracy Filters  (RSI, ATR, Momentum, Session, Cooldown)
+      Layer 5 — Stochastic 10,3,5 (oversold/overbought + crossover)  ← NEW v2.1
+
+    All layers must agree on direction for highest confidence.
+    Conflict between layers suppresses the signal.
+    """
+
+    SIGNAL_THRESHOLD = 62
+
+    def __init__(self):
+        self.psychology = CandlePsychologyEngine()
+        self.crt        = CRTVolumeEngine(min_confidence=55)
+
+        # One cooldown tracker lives on the engine — persists across all
+        # evaluate() calls for the lifetime of the bot.
+        self.cooldown = SignalCooldownTracker()
+
+    # ────────────────────────────────────────────────────────────────────────
+    # HELPER: resolve asset type for session / filter routing
+    # ────────────────────────────────────────────────────────────────────────
+    def _get_asset_type(self, asset: str) -> str:
+        """
+        Infer asset type from the symbol name so filters can apply the right
+        session windows and OTC-tolerances without needing a catalogue lookup.
+        """
+        base = asset.replace("-OTC", "").upper()
+
+        if any(k in base for k in ["BTC", "ETH", "BNB", "SOL", "XRP"]):
+            return "crypto"
+
+        if any(k in base for k in ["XAU", "XAG", "GOLD", "SILVER", "OIL", "USOIL", "UKOIL"]):
+            return "commodity"
+
+        if any(k in base for k in ["SPX", "NDX", "DJI", "FTSE", "DAX", "NAS", "SP500"]):
+            return "index"
+
+        if "/" not in base and len(base) <= 5 and base.isalpha():
+            return "stock"
+
+        return "forex"
+
+    # ────────────────────────────────────────────────────────────────────────
+    # HELPER: current trading session (UTC-based)  ← NEW v2.1
+    # ────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _get_current_session() -> tuple:
+        """
+        Returns (session_label, quality_flag) based on current UTC hour.
+
+        Sessions (UTC):
+          Sydney    21:00 – 06:00
+          Asian     00:00 – 09:00   (peak Tokyo liquidity 00-03)
+          London    07:00 – 16:00   (peak 07-12)
+          New York  12:00 – 21:00   (peak 13-17)
+          Overlaps:
+            Asian/London  07:00 – 09:00  ← best for EUR/GBP pairs
+            London/NY     12:00 – 16:00  ← highest liquidity of the day
+          Dead zone      21:00 – 23:59  (low liquidity, avoid forex)
+
+        quality_flag: "peak" | "active" | "overlap" | "dead"
+        """
+        hour = datetime.now(timezone.utc).hour
+
+        if 12 <= hour < 16:
+            return "🇬🇧🗽 London / New York Overlap", "overlap"
+        elif 7 <= hour < 9:
+            return "🌏🇬🇧 Asian / London Overlap", "overlap"
+        elif 7 <= hour < 12:
+            return "🇬🇧 London", "peak"
+        elif 16 <= hour < 17:
+            return "🗽 New York (Open)", "peak"
+        elif 17 <= hour < 21:
+            return "🗽 New York (Late)", "active"
+        elif 0 <= hour < 6:
+            return "🌏 Asian (Tokyo)", "active"
+        elif 6 <= hour < 7:
+            return "🌏 Asian (Late)", "active"
+        elif 21 <= hour <= 23:
+            return "🌙 Off-Hours / Sydney", "dead"
+        else:
+            return "🌙 Off-Hours", "dead"
+
+    # ────────────────────────────────────────────────────────────────────────
+    # HELPER: Slow Stochastic (10, 3, 5)  ← NEW v2.1
+    # ────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def calculate_stochastic(
+        candles:  list,
+        k_period: int = 10,
+        k_smooth: int = 3,
+        d_period: int = 5,
+    ) -> tuple:
+        """
+        Full Slow Stochastic (K_period=10, K_smooth=3, D_period=5).
+
+        Fast %K  = (Close − LowestLow_N) / (HighestHigh_N − LowestLow_N) × 100
+        Slow %K  = SMA(Fast %K, k_smooth)   ← the line traders call %K
+        %D       = SMA(Slow %K, d_period)   ← signal / confirmation line
+
+        Accepts a list of dicts with keys: open, high, low, close.
+
+        Returns (slow_k, d) — both 0-100.
+        Returns (50.0, 50.0) if not enough data (neutral — no effect on signal).
+        """
+        needed = k_period + k_smooth + d_period - 2
+        if len(candles) < needed:
+            return 50.0, 50.0
+
+        # ── Build fast %K series ──────────────────────────────────────────
+        fast_k_series = []
+        for i in range(k_period - 1, len(candles)):
+            window     = candles[i - k_period + 1 : i + 1]
+            lowest_low = min(c["low"]  for c in window)
+            highest_hi = max(c["high"] for c in window)
+            denom      = highest_hi - lowest_low
+            if denom == 0:
+                fast_k_series.append(50.0)
+            else:
+                fast_k_series.append(
+                    (candles[i]["close"] - lowest_low) / denom * 100
+                )
+
+        # ── Slow %K = rolling SMA(k_smooth) of fast %K ───────────────────
+        slow_k_series = [
+            statistics.mean(fast_k_series[j - k_smooth + 1 : j + 1])
+            for j in range(k_smooth - 1, len(fast_k_series))
+        ]
+
+        # ── %D = rolling SMA(d_period) of slow %K ────────────────────────
+        d_series = [
+            statistics.mean(slow_k_series[j - d_period + 1 : j + 1])
+            for j in range(d_period - 1, len(slow_k_series))
+        ]
+
+        if not slow_k_series or not d_series:
+            return 50.0, 50.0
+
+        return round(slow_k_series[-1], 2), round(d_series[-1], 2)
+
+    # ────────────────────────────────────────────────────────────────────────
+    # EMA + S/R CALCULATIONS
+    # ────────────────────────────────────────────────────────────────────────
+    def calculate_ema(self, prices: list, period: int) -> float:
+        if len(prices) < period:
+            return prices[-1] if prices else 0.0
+        k = 2 / (period + 1)
+        ema = statistics.mean(prices[:period])
+        for price in prices[period:]:
+            ema = price * k + ema * (1 - k)
+        return ema
+
+    def get_levels(self, candles: list) -> TechnicalLevels:
+        if not candles:
+            return TechnicalLevels()
+
+        closes = [c.close for c in candles]
+        highs  = [c.high  for c in candles]
+        lows   = [c.low   for c in candles]
+
+        ema9  = self.calculate_ema(closes, 9)
+        ema21 = self.calculate_ema(closes, 21)
+        ema50 = self.calculate_ema(closes, min(50, len(closes)))
+
+        resistance = sorted(set(round(h, 5) for h in sorted(highs)[-10:]))
+        support    = sorted(set(round(l, 5) for l in sorted(lows)[:10]))
+
+        if ema9 > ema21 > ema50:
+            trend = "BULLISH"
+        elif ema9 < ema21 < ema50:
+            trend = "BEARISH"
+        else:
+            trend = "SIDEWAYS"
+
+        return TechnicalLevels(
+            ema_9=ema9, ema_21=ema21, ema_50=ema50,
+            support_levels=support, resistance_levels=resistance, trend=trend
+        )
+
+    def at_key_level(self, price: float, levels: TechnicalLevels) -> tuple:
+        tolerance = price * 0.0008
+        for r in levels.resistance_levels:
+            if abs(price - r) <= tolerance:
+                return True, f"At Resistance ({r:.5f})"
+        for s in levels.support_levels:
+            if abs(price - s) <= tolerance:
+                return True, f"At Support ({s:.5f})"
+        for ema_val, ema_name in [
+            (levels.ema_9,  "EMA 9"),
+            (levels.ema_21, "EMA 21"),
+            (levels.ema_50, "EMA 50")
+        ]:
+            if abs(price - ema_val) <= tolerance * 2:
+                return True, f"At {ema_name} ({ema_val:.5f})"
+        return False, ""
+
+    def _candles_to_dicts(self, candles: list) -> list:
+        """Convert Candle objects to dicts for the CRT engine and filters."""
+        return [
+            {
+                "open":   c.open,
+                "high":   c.high,
+                "low":    c.low,
+                "close":  c.close,
+                "volume": c.volume,
+            }
+            for c in candles
+        ]
+
+    # ────────────────────────────────────────────────────────────────────────
+    # MAIN EVALUATION PIPELINE
+    # ────────────────────────────────────────────────────────────────────────
+    def evaluate(
+        self,
+        asset: str,
+        candles: list,
+        forming_candle: Optional[Candle] = None,
+        elapsed_seconds: float = 0.0,
+        timestamp: str = ""
+    ) -> Optional[FinalSignal]:
+
+        if len(candles) < 5:
+            return None
+
+        levels  = self.get_levels(candles)
+        current = candles[-1]
+
+        # ── Layer 1: Candle Psychology ────────────────────────────────────
+        candle_sig = self.psychology.analyse(candles[-5:])
+        pre_close  = False
+
+        if forming_candle and elapsed_seconds >= 40:
+            live_sig = self.psychology.predict_forming_candle(forming_candle, elapsed_seconds)
+            if live_sig and (candle_sig is None or
+                             live_sig.confidence > candle_sig.confidence * 0.85):
+                candle_sig = live_sig
+                pre_close  = True
+
+        # ── Layer 2: CRT + Volume ─────────────────────────────────────────
+        candle_dicts = self._candles_to_dicts(candles)
+        forming_dict = {
+            "open": forming_candle.open, "high": forming_candle.high,
+            "low":  forming_candle.low,  "close": forming_candle.close,
+            "volume": forming_candle.volume
+        } if forming_candle else None
+
+        crt_sig = self.crt.analyse(
+            asset           = asset,
+            candles         = candle_dicts,
+            forming_candle  = forming_dict,
+            elapsed_seconds = int(elapsed_seconds),
+        )
+
+        # ── Layer 3: Direction conflict check ─────────────────────────────
+        if candle_sig and crt_sig:
+            if candle_sig.direction != crt_sig.direction:
+                return None   # Layers conflict — skip this candle
+
+        if candle_sig is None and crt_sig is None:
+            return None
+
+        lead_direction = (candle_sig.direction if candle_sig
+                          else crt_sig.direction)
+
+        # ── Confluence scoring ────────────────────────────────────────────
+        confluence = []
+        boost      = 0.0
+
+        if lead_direction == "CALL" and levels.trend == "BULLISH":
+            confluence.append("✅ EMA trend aligns BULLISH (9 > 21 > 50)")
+            boost += 0.08
+        elif lead_direction == "PUT" and levels.trend == "BEARISH":
+            confluence.append("✅ EMA trend aligns BEARISH (9 < 21 < 50)")
+            boost += 0.08
+        elif levels.trend == "SIDEWAYS":
+            confluence.append("⚠️ Sideways trend — lower reliability")
+            boost -= 0.04
+        else:
+            confluence.append("❌ Counter-trend signal — use caution")
+            boost -= 0.10
+
+        if levels.ema_9 != 0 and levels.ema_21 != 0:
+            gap = abs(levels.ema_9 - levels.ema_21) / current.close * 100
+            if gap > 0.05:
+                confluence.append(f"✅ EMA spread {gap:.3f}% — trending momentum")
+                boost += 0.04
+            else:
+                confluence.append(f"⚠️ EMAs flat ({gap:.3f}%) — choppy market")
+                boost -= 0.02
+
+        at_level, level_desc = self.at_key_level(current.close, levels)
+        if at_level:
+            confluence.append(f"✅ {level_desc} — highest-probability zone")
+            boost += 0.12
+
+        if candle_sig and candle_sig.sub_patterns:
+            extras = ", ".join(candle_sig.sub_patterns)
+            confluence.append(f"✅ Confirmed by: {extras}")
+            boost += 0.05 * len(candle_sig.sub_patterns)
+
+        if current.body_ratio > 0.55:
+            confluence.append(f"✅ Strong candle body ({current.body_ratio:.0%}) — high conviction")
+            boost += 0.04
+        elif current.body_ratio < 0.20:
+            confluence.append("⚠️ Small candle body — weak conviction")
+            boost -= 0.03
+
+        if crt_sig:
+            confluence.append("━━━ CRT + VOLUME LAYER ━━━")
+            confluence.extend(crt_sig.confluence_factors)
+            crt_boost = (crt_sig.confidence / 100) * 0.15
+            boost += crt_boost
+
+        # ── Base confidence (pre-filter) ──────────────────────────────────
+        base_conf = candle_sig.confidence if candle_sig else (crt_sig.confidence / 100)
+        raw       = base_conf + boost
+
+        # ═════════════════════════════════════════════════════════════════
+        # ── Layer 5: STOCHASTIC (10, 3, 5)  ← NEW v2.1 ───────────────────
+        # ═════════════════════════════════════════════════════════════════
+        stoch_k, stoch_d = self.calculate_stochastic(candle_dicts)
+
+        confluence.append("━━━ STOCHASTIC (10,3,5) ━━━")
+
+        if lead_direction == "CALL":
+            if stoch_k < 20 and stoch_d < 20:
+                confluence.append(
+                    f"✅ Oversold — %K={stoch_k:.1f}  %D={stoch_d:.1f}  → CALL confirmed"
+                )
+                boost += 0.07
+            elif stoch_k < 35:
+                confluence.append(
+                    f"☑️ Low zone — %K={stoch_k:.1f}  %D={stoch_d:.1f}  → mild CALL support"
+                )
+                boost += 0.03
+            elif stoch_k > 75:
+                confluence.append(
+                    f"⚠️ Overbought — %K={stoch_k:.1f}  %D={stoch_d:.1f}  → CALL risk"
+                )
+                boost -= 0.06
+            else:
+                confluence.append(
+                    f"➡️ Neutral — %K={stoch_k:.1f}  %D={stoch_d:.1f}"
+                )
+
+        else:  # PUT
+            if stoch_k > 80 and stoch_d > 80:
+                confluence.append(
+                    f"✅ Overbought — %K={stoch_k:.1f}  %D={stoch_d:.1f}  → PUT confirmed"
+                )
+                boost += 0.07
+            elif stoch_k > 65:
+                confluence.append(
+                    f"☑️ High zone — %K={stoch_k:.1f}  %D={stoch_d:.1f}  → mild PUT support"
+                )
+                boost += 0.03
+            elif stoch_k < 25:
+                confluence.append(
+                    f"⚠️ Oversold — %K={stoch_k:.1f}  %D={stoch_d:.1f}  → PUT risk"
+                )
+                boost -= 0.06
+            else:
+                confluence.append(
+                    f"➡️ Neutral — %K={stoch_k:.1f}  %D={stoch_d:.1f}"
+                )
+
+        # %K / %D crossover — only fires in mid-zone to avoid double-counting extremes
+        if lead_direction == "CALL" and stoch_k > stoch_d and 20 <= stoch_k <= 60:
+            confluence.append(
+                f"✅ %K crossed above %D — bullish momentum building"
+            )
+            boost += 0.03
+        elif lead_direction == "PUT" and stoch_k < stoch_d and 40 <= stoch_k <= 80:
+            confluence.append(
+                f"✅ %K crossed below %D — bearish momentum building"
+            )
+            boost += 0.03
+        # ═════════════════════════════════════════════════════════════════
+
+        # ── Session detection  ← NEW v2.1 ────────────────────────────────
+        session_label, session_quality = self._get_current_session()
+
+        # ═════════════════════════════════════════════════════════════════
+        # ── Layer 4: ACCURACY FILTER SUITE ───────────────────────────────
+        # ═════════════════════════════════════════════════════════════════
+        is_otc     = asset.endswith("-OTC")
+        asset_type = self._get_asset_type(asset)
+        closes     = [c.close for c in candles]
+
+        filter_result = run_all_filters(
+            asset        = asset,
+            asset_type   = asset_type,
+            direction    = lead_direction,
+            candle_dicts = candle_dicts,
+            closes       = closes,
+            cooldown     = self.cooldown,
+            is_otc       = is_otc,
+        )
+
+        # Hard suppress — dead market, extreme RSI, news spike, dead session
+        if filter_result.suppress:
+            return None
+
+        # Apply filter delta to raw confidence
+        raw += filter_result.confidence_delta
+
+        # Append filter factors to confluence block
+        if filter_result.factors:
+            confluence.append("━━━ ACCURACY FILTERS ━━━")
+            confluence.extend(filter_result.factors)
+
+        # ── Final confidence gate ─────────────────────────────────────────
+        final_pct = int(max(0, min(raw, 0.97)) * 100)
+
+        if final_pct < self.SIGNAL_THRESHOLD:
+            return None
+
+        # ── Pattern label ─────────────────────────────────────────────────
+        if candle_sig and crt_sig:
+            pattern     = f"{candle_sig.pattern} + CRT {crt_sig.sweep_side.replace('_', ' ').title()}"
+            description = candle_sig.description
+            emoji       = candle_sig.emoji + " 📐"
+        elif crt_sig:
+            pattern     = f"CRT {crt_sig.sweep_side.replace('_', ' ').title()}"
+            description = (f"CRT sweep detected — Vol spike {crt_sig.volume.volume_ratio:.1f}x | "
+                           f"Range: {crt_sig.zone.range_low:.5f}–{crt_sig.zone.range_high:.5f}")
+            emoji       = "📐⚡"
+        else:
+            pattern     = candle_sig.pattern
+            description = candle_sig.description
+            emoji       = candle_sig.emoji
+
+        # ── Entry note ────────────────────────────────────────────────────
+        if pre_close:
+            entry_note = f"⚡ PRE-CLOSE ALERT at {elapsed_seconds:.0f}s — Enter NOW on next candle open"
+        else:
+            entry_note = "Enter at open of NEXT candle after current closes"
+
+        # ── Build final signal ────────────────────────────────────────────
+        signal = FinalSignal(
+            asset              = asset,
+            direction          = lead_direction,
+            confidence         = final_pct,
+            candle_pattern     = pattern,
+            candle_description = description,
+            candle_emoji       = emoji,
+            confluence_factors = confluence,
+            entry_note         = entry_note,
+            expiry             = "M1",
+            timestamp          = timestamp,
+            pre_close          = pre_close,
+            session            = session_label,   # ← NEW v2.1
+        )
+
+        # Record cooldown AFTER signal is confirmed — prevents chasing
+        self.cooldown.record(asset, lead_direction)
+
+        return signal
+
+
+
+
+
+""" Only WS session timeout to fix in code
+╔══════════════════════════════════════════════════════════════╗
+║          BINARY SIGNAL ROBOT — TELEGRAM BOT  v2.1            ║
+║   Expert 1-Minute Binary Options Signal Bot                  ║
+║   Powered by Candle Psychology + CRT + RSI + ATR Filters     ║
+║   + Stochastic (10,3,5) + Session Display                    ║
+║                                                              ║
+║   NEW IN v2.1                                                ║
+║   ✦ Session label shown on every signal (London, NY etc.)    ║
+║   ✦ Stochastic (10,3,5) confluence in signal message         ║
+║                                                              ║
+║   Commands:                                                  ║
+║   /start   — Welcome + category selector                     ║
+║   /pairs   — Back to category/pair selector any time         ║
+║   /stats   — Performance stats for this session              ║
+║   /stop    — Pause all signals                               ║
+║   /resume  — Resume + re-open pair selector                  ║
+║   /help    — Command reference                               ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+
+import asyncio
+import logging
+import os
+from datetime import datetime, timezone
+from typing import Optional
+from dotenv import load_dotenv
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    ContextTypes, JobQueue
+)
+from telegram.constants import ParseMode
+
+from data_feed import TwelveDataFeed, ASSET_CATALOGUE, find_asset
+from po_data_feed import PocketOptionFeed
+from signal_engine import ConfluenceEngine, FinalSignal
+from candle_psychology import Candle
+
+load_dotenv()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("BinaryRobot")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OTC PAIRS  (Pocket Option synthetic pairs — data proxied from real market)
+# ─────────────────────────────────────────────────────────────────────────────
+OTC_PAIRS = {
+    "EUR/USD-OTC": "EUR/USD",
+    "GBP/USD-OTC": "GBP/USD",
+    "USD/JPY-OTC": "USD/JPY",
+    "AUD/USD-OTC": "AUD/USD",
+    "USD/CAD-OTC": "USD/CAD",
+    "USD/CHF-OTC": "USD/CHF",
+    "EUR/JPY-OTC": "EUR/JPY",
+    "EUR/GBP-OTC": "EUR/GBP",
+    "GBP/JPY-OTC": "GBP/JPY",
+    "NZD/USD-OTC": "NZD/USD",
+    "EUR/AUD-OTC": "EUR/AUD",
+    "AUD/JPY-OTC": "AUD/JPY",
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CATEGORY DISPLAY CONFIG
+# Each entry: (callback_id, icon, label, symbols_list, cols_per_row)
+# ─────────────────────────────────────────────────────────────────────────────
+CATEGORY_DISPLAY = [
+    ("forex",       "💱", "Forex Majors",
+     list(ASSET_CATALOGUE["Forex"].keys()), 3),
+
+    ("otc",         "🔵", "OTC Pairs",
+     list(OTC_PAIRS.keys()), 2),
+
+    ("crypto",      "₿",  "Crypto",
+     list(ASSET_CATALOGUE["Crypto"].keys()), 3),
+
+    ("commodities", "🥇", "Commodities",
+     list(ASSET_CATALOGUE["Commodities"].keys()), 2),
+
+    ("stocks",      "📈", "Stocks",
+     list(ASSET_CATALOGUE["Stocks"].keys()), 3),
+
+    ("indices",     "📊", "Indices",
+     list(ASSET_CATALOGUE["Indices"].keys()), 3),
+]
+
+# Build fast lookups
+_CAT_BY_ID  = {cid: (icon, label, syms, cols) for cid, icon, label, syms, cols in CATEGORY_DISPLAY}
+_SYM_TO_CAT = {}
+for cid, icon, label, syms, cols in CATEGORY_DISPLAY:
+    for s in syms:
+        _SYM_TO_CAT[s] = cid
+
+
+def resolve_symbol(symbol: str) -> str:
+    """OTC symbol → real market symbol for data fetching."""
+    return OTC_PAIRS.get(symbol, symbol)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KEYBOARD BUILDERS  (all UI lives here — pure functions for easy testing)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_category_keyboard() -> InlineKeyboardMarkup:
+    """Main menu: one button per category, 2 per row."""
+    keyboard = []
+    row = []
+    for cid, icon, label, _, _ in CATEGORY_DISPLAY:
+        row.append(InlineKeyboardButton(f"{icon} {label}", callback_data=f"cat_{cid}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_pairs_keyboard(cat_id: str) -> InlineKeyboardMarkup:
+    """Pair grid for a category + Back button."""
+    icon, label, syms, cols = _CAT_BY_ID[cat_id]
+    keyboard = []
+    row = []
+    for sym in syms:
+        display = sym.replace("-OTC", " OTC")
+        row.append(InlineKeyboardButton(display, callback_data=f"pair_{sym}"))
+        if len(row) == cols:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("⬅️ Categories", callback_data="cat_menu")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_post_signal_keyboard() -> InlineKeyboardMarkup:
+    """Toggle shown below every signal message."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📂 Change Pair", callback_data="change_pair"),
+        InlineKeyboardButton("🔄 Same Pair",   callback_data="same_pair"),
+    ]])
+
+
+def build_paused_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("▶️ Resume & Pick Pair", callback_data="resume_pick"),
+    ]])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MESSAGE FORMATTER
+# ─────────────────────────────────────────────────────────────────────────────
+class MessageFormatter:
+
+    @staticmethod
+    def signal_message(sig: FinalSignal, elapsed: int = 0) -> str:
+        """
+        Formats a FinalSignal into a Telegram message.
+
+        ENTRY CLARITY:
+          pre_close = True  →  ⚡ ENTER NOW  (candle closing, next open imminent)
+          pre_close = False →  ⏱ NEXT CANDLE  (enter at open of next candle)
+
+        v2.1: Session label shown directly under Asset.
+              Stochastic values appear inside the Confluence block
+              (already populated by signal_engine).
+        """
+        direction_emoji = "📈" if sig.direction == "CALL" else "📉"
+        direction_color = "🟢" if sig.direction == "CALL" else "🔴"
+
+        # ── Confidence bar ────────────────────────────────────────────────
+        filled = int(sig.confidence / 10)
+        bar    = "█" * filled + "░" * (10 - filled)
+
+        if sig.confidence >= 85:
+            strength = "🔥 EXTREME"
+        elif sig.confidence >= 73:
+            strength = "💪 STRONG"
+        elif sig.confidence >= 62:
+            strength = "✅ MODERATE"
+        else:
+            strength = "⚠️ WEAK"
+
+        # ── Session line (NEW v2.1) ────────────────────────────────────────
+        # sig.session is always populated by signal_engine._get_current_session()
+        # Falls back gracefully to empty string if somehow missing.
+        session_line = f"🕐 *Session:*  {sig.session}\n" if sig.session else ""
+
+        # ── ENTRY BLOCK ───────────────────────────────────────────────────
+        if sig.pre_close:
+            secs_left = max(0, 60 - elapsed)
+            entry_block = (
+                f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+                f"┃  ⚡⚡  E N T E R   N O W  ⚡⚡  ┃\n"
+                f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+                f"_Place trade immediately_\n"
+                f"_Candle closing in ~{secs_left}s — next open is your entry_"
+            )
+        else:
+            entry_block = (
+                f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+                f"┃  ⏱  N E X T  C A N D L E  ⏱  ┃\n"
+                f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+                f"_Wait for current candle to close_\n"
+                f"_Enter at the OPEN of the next candle_"
+            )
+
+        # ── Confluence block ──────────────────────────────────────────────
+        # ── Confluence block — Session + FVG only ────────────────────────
+        fvg_lines = []
+        in_fvg_block = False
+        for line in sig.confluence_factors:
+            if "ICT FVG STRUCTURE" in line:
+                in_fvg_block = True
+                fvg_lines.append(line)
+            elif in_fvg_block and line.startswith("━━━"):
+                in_fvg_block = False   # another section started — stop
+            elif in_fvg_block:
+                fvg_lines.append(line)
+
+        confluence_text = (
+            "\n".join(f"  {f}" for f in fvg_lines)
+            if fvg_lines else "  _No FVG structure_"
+        )
+
+        msg = (
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{direction_emoji} *BINARY SIGNAL*  {direction_color}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 *Asset:*    `{sig.asset}`\n"
+            f"{session_line}"
+            f"🎯 *Action:*   *{sig.direction}*  "
+            f"({'UP ↑' if sig.direction == 'CALL' else 'DOWN ↓'})\n"
+            f"⏱ *Expiry:*  `{sig.expiry}`\n\n"
+            f"📐 *Pattern:* {sig.candle_emoji} _{sig.candle_pattern}_\n"
+            f"💬 _{sig.candle_description}_\n\n"
+            f"📊 *Confidence:* `{sig.confidence}%`  {strength}\n"
+            f"`[{bar}]`\n\n"
+            f"🎯 *ICT Structure:*\n"
+            f"{confluence_text}\n\n"
+            f"🕐 `{sig.timestamp}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{entry_block}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"_Risk responsibly. 1–3% per trade._"
+        )
+        return msg
+
+    @staticmethod
+    def no_signal_message(symbol: str) -> str:
+        return (
+            f"🔍 *No Signal — `{symbol}`*\n\n"
+            f"No high-confluence setup detected.\n"
+            f"_Threshold: 62% — market may be choppy_\n\n"
+            f"Tap *Same Pair* to re-scan or *Change Pair* to pick another."
+        )
+
+    @staticmethod
+    def welcome_message(name: str) -> str:
+        return (
+            f"👋 Welcome, *{name}*!\n\n"
+            f"🤖 *Binary Signal Robot v2.1*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"I scan live M1 candles using:\n"
+            f"  🕯 *Candle Psychology* (12+ patterns)\n"
+            f"  📐 *CRT + Volume* sweep detection\n"
+            f"  📊 *RSI + ATR* accuracy filters\n"
+            f"  📉 *Stochastic (10,3,5)* confirmation\n"
+            f"  🕰 *EMA 9/21/50* trend alignment\n"
+            f"  🏔 *Support & Resistance* levels\n"
+            f"  🌍 *Session awareness* (London/NY/Asian)\n\n"
+            f"*How it works:*\n"
+            f"  1️⃣  Pick a *category* below\n"
+            f"  2️⃣  Tap a *pair* — signal fires instantly\n"
+            f"  3️⃣  Bot auto-scans every 60s from there\n"
+            f"  4️⃣  After each signal — tap *Change* or *Same*\n\n"
+            f"📡 *Assets:* Forex · OTC · Crypto · Commodities · Stocks · Indices\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"_Select a category to begin:_"
+        )
+
+    @staticmethod
+    def category_menu_text() -> str:
+        return (
+            "📂 *Select a Category*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "_Tap a category to see available pairs:_"
+        )
+
+    @staticmethod
+    def pairs_menu_text(icon: str, label: str, count: int) -> str:
+        return (
+            f"{icon} *{label}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"_Tap a pair to start receiving signals:_\n"
+            f"_{count} pairs available_"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BOT STATE  (one active pair per user — no watchlists)
+# ─────────────────────────────────────────────────────────────────────────────
+class BotState:
+    def __init__(self):
+        self.active_pair: dict = {}   # chat_id → current pair symbol
+        self.paused:      set  = set()
+        self.stats:       dict = {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN BOT
+# ─────────────────────────────────────────────────────────────────────────────
+class BinarySignalBot:
+
+    SCAN_INTERVAL     = 60   # seconds between auto-scans
+    PRE_CLOSE_TRIGGER = 45   # seconds into candle: pre-close window
+
+    def __init__(self, telegram_token: str, twelve_api_key: str):
+        self.token  = telegram_token
+        po_ssid     = os.getenv("PO_SSID", "")
+        po_demo     = os.getenv("PO_DEMO", "true").lower() == "true"
+
+        # Store config — don't connect yet
+        if po_ssid:
+            self.feed = PocketOptionFeed(ssid=po_ssid, demo=po_demo)
+        else:
+            self.feed = TwelveDataFeed(twelve_api_key)
+
+        self.engine    = ConfluenceEngine()
+        self.formatter = MessageFormatter()
+        self.state     = BotState()
+        self.app       = Application.builder().token(telegram_token).job_queue(JobQueue()).build()
+        self._register_handlers()
+ 
+    async def run(self):
+        logger.info("🤖 Binary Signal Robot v2.1 starting...")
+
+        # ✅ Connect feed HERE where await is valid
+        if isinstance(self.feed, PocketOptionFeed):
+            await self.feed.connect()
+
+        try:
+            await self.app.initialize()
+            await self.app.start()
+            await self.app.updater.start_polling(drop_pending_updates=True)
+            logger.info("🚀 Bot is live — waiting for commands...")
+            await asyncio.Event().wait()
+        finally:
+            try:
+                await self.app.updater.stop()
+                await self.app.stop()
+                await self.app.shutdown()
+            except Exception:
+                pass
+            await self.feed.close()
+
+    # ── HANDLER REGISTRATION ──────────────────────────────────────────────
+
+    def _register_handlers(self):
+        self.app.add_handler(CommandHandler("start",  self.cmd_start))
+        self.app.add_handler(CommandHandler("pairs",  self.cmd_pairs))
+        self.app.add_handler(CommandHandler("help",   self.cmd_help))
+        self.app.add_handler(CommandHandler("stats",  self.cmd_stats))
+        self.app.add_handler(CommandHandler("stop",   self.cmd_stop))
+        self.app.add_handler(CommandHandler("resume", self.cmd_resume))
+        self.app.add_handler(CallbackQueryHandler(self.handle_callback))
+
+    # ── STATE HELPERS ─────────────────────────────────────────────────────
+
+    def _ensure_state(self, chat_id: int):
+        if chat_id not in self.state.stats:
+            self.state.stats[chat_id] = {"signals_sent": 0, "calls": 0, "puts": 0}
+
+    def _start_scan_job(self, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
+        """
+        Cancel any existing scan job for this chat, then start a new one.
+        Called whenever the user selects a new pair.
+        """
+        job_name = f"scan_{chat_id}"
+        for job in ctx.job_queue.get_jobs_by_name(job_name):
+            job.schedule_removal()
+        ctx.job_queue.run_repeating(
+            self._auto_scan_job,
+            interval=self.SCAN_INTERVAL,
+            first=self.SCAN_INTERVAL,
+            name=job_name,
+            data={"chat_id": chat_id}
+        )
+
+    def _record_stat(self, chat_id: int, sig: FinalSignal):
+        self._ensure_state(chat_id)
+        s = self.state.stats[chat_id]
+        s["signals_sent"] += 1
+        s["calls"] += (1 if sig.direction == "CALL" else 0)
+        s["puts"]  += (1 if sig.direction == "PUT"  else 0)
+
+    # ── COMMANDS ─────────────────────────────────────────────────────────
+
+    async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        self._ensure_state(chat_id)
+        name = update.effective_user.first_name or "Trader"
+
+        await update.message.reply_text(
+            self.formatter.welcome_message(name),
+            reply_markup=build_category_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    async def cmd_pairs(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Shortcut to re-open the category selector at any time."""
+        await update.message.reply_text(
+            self.formatter.category_menu_text(),
+            reply_markup=build_category_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    async def cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        active  = self.state.active_pair.get(chat_id)
+        active_text = f"`{active}`" if active else "_none selected_"
+
+        msg = (
+            "🤖 *Binary Signal Robot v2.1 — Help*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "*/start*  — Welcome screen + pair selector\n"
+            "*/pairs*  — Open category/pair selector any time\n"
+            "*/stats*  — Session performance stats\n"
+            "*/stop*   — Pause auto-signals\n"
+            "*/resume* — Resume + re-open pair selector\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "*How to use:*\n"
+            "  1️⃣  Tap a category\n"
+            "  2️⃣  Tap a pair → signal fires immediately\n"
+            "  3️⃣  Bot auto-scans that pair every 60s\n"
+            "  4️⃣  After signal → tap *Change Pair* or *Same Pair*\n\n"
+            f"📡 *Currently watching:* {active_text}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "*Entry Types:*\n"
+            "  ⚡ *ENTER NOW* — Pre-close alert (40–55s mark)\n"
+            "    Enter immediately, candle closing\n"
+            "  ⏱ *NEXT CANDLE* — Pattern confirmed on close\n"
+            "    Enter at open of the next candle\n\n"
+            "*Indicators used:*\n"
+            "  📉 Stochastic (10,3,5) — oversold/overbought zones\n"
+            "  🌍 Session — London · NY · Asian · Overlaps shown\n\n"
+            "_Minimum confidence: 62%_\n"
+            "_Only high-confluence setups are sent._"
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+    async def cmd_stats(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        self._ensure_state(chat_id)
+        s      = self.state.stats[chat_id]
+        active = self.state.active_pair.get(chat_id, "None")
+        total  = s["signals_sent"]
+
+        await update.message.reply_text(
+            f"📊 *Session Statistics*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📡 Active Pair:    `{active}`\n"
+            f"🔔 Signals Sent:   `{total}`\n"
+            f"📈 CALL Signals:   `{s['calls']}`\n"
+            f"📉 PUT Signals:    `{s['puts']}`\n\n"
+            f"_Stats reset each session._",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    async def cmd_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        self.state.paused.add(chat_id)
+        await update.message.reply_text(
+            "⏸ *Signals paused.*\n\n"
+            "_Tap Resume to restart and pick a pair._",
+            reply_markup=build_paused_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    async def cmd_resume(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        self.state.paused.discard(chat_id)
+        await update.message.reply_text(
+            "▶️ *Signals resumed!*\n\n"
+            "_Pick a pair to start scanning:_",
+            reply_markup=build_category_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    # ── CALLBACK HANDLER ─────────────────────────────────────────────────
+
+    async def handle_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        query   = update.callback_query
+        await query.answer()
+        data    = query.data
+        chat_id = update.effective_chat.id
+        self._ensure_state(chat_id)
+
+        try:
+            await self._dispatch_callback(query, data, chat_id, ctx)
+        except Exception as e:
+            logger.error(f"Callback error [{data}] chat={chat_id}: {e}")
+
+    async def _dispatch_callback(self, query, data: str, chat_id: int, ctx):
+        """
+        All tap actions route through here.
+
+        cat_menu          → show category selector
+        cat_{id}          → show pairs for that category
+        pair_{symbol}     → select pair, run immediate analysis
+        change_pair       → show category selector (from post-signal toggle)
+        same_pair         → re-analyse the current active pair immediately
+        resume_pick       → unpause + show category selector
+        """
+
+        # ── CATEGORY MENU ────────────────────────────────────────────────
+        if data == "cat_menu":
+            await query.edit_message_text(
+                self.formatter.category_menu_text(),
+                reply_markup=build_category_keyboard(),
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+        # ── CATEGORY SELECTED → show pairs ───────────────────────────────
+        elif data.startswith("cat_"):
+            cat_id = data[4:]
+            if cat_id not in _CAT_BY_ID:
+                return
+            icon, label, syms, cols = _CAT_BY_ID[cat_id]
+            await query.edit_message_text(
+                self.formatter.pairs_menu_text(icon, label, len(syms)),
+                reply_markup=build_pairs_keyboard(cat_id),
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+        # ── PAIR SELECTED → set active, run immediate analysis ───────────
+        elif data.startswith("pair_"):
+            symbol = data[5:]
+            await self._select_pair_and_analyse(query, chat_id, symbol, ctx)
+
+        # ── CHANGE PAIR (post-signal toggle) → category selector ─────────
+        elif data == "change_pair":
+            await query.edit_message_text(
+                self.formatter.category_menu_text(),
+                reply_markup=build_category_keyboard(),
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+        # ── SAME PAIR (post-signal toggle) → re-analyse immediately ──────
+        elif data == "same_pair":
+            symbol = self.state.active_pair.get(chat_id)
+            if not symbol:
+                await query.edit_message_text(
+                    "⚠️ No active pair found.\n_Pick a pair to continue:_",
+                    reply_markup=build_category_keyboard(),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            await query.edit_message_text(
+                f"⏳ *Re-scanning `{symbol}`...*",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            await self._run_analysis_and_send(chat_id, symbol, ctx.bot)
+
+        # ── RESUME + PICK PAIR ────────────────────────────────────────────
+        elif data == "resume_pick":
+            self.state.paused.discard(chat_id)
+            await query.edit_message_text(
+                "▶️ *Resumed!*\n\n_Pick a pair to start scanning:_",
+                reply_markup=build_category_keyboard(),
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+    # ── PAIR SELECTION FLOW ───────────────────────────────────────────────
+
+    async def _select_pair_and_analyse(
+        self,
+        query,
+        chat_id: int,
+        symbol:  str,
+        ctx:     ContextTypes.DEFAULT_TYPE
+    ):
+        """
+        Called when user taps a pair button.
+        1. Set as active pair
+        2. Show "Analysing..." in the menu message
+        3. Run analysis
+        4. Send signal (or no-signal) as new message with post-signal toggle
+        5. Start / restart the 60s auto-scan job
+        """
+        self.state.active_pair[chat_id] = symbol
+        self.state.paused.discard(chat_id)
+
+        await query.edit_message_text(
+            f"⏳ *Analysing `{symbol}`...*\n"
+            f"_Scanning M1 candles — please wait_",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+        await self._run_analysis_and_send(chat_id, symbol, ctx.bot)
+        self._start_scan_job(ctx, chat_id)
+
+    async def _run_analysis_and_send(self, chat_id: int, symbol: str, bot):
+        """
+        Core: analyse one symbol and send the result to the chat.
+        Always attaches the post-signal toggle keyboard.
+        """
+        signal  = await self._analyse_asset(symbol)
+        elapsed = await self.feed.get_current_seconds_into_minute()
+
+        if signal:
+            self._record_stat(chat_id, signal)
+            try:
+                await bot.send_message(
+                    chat_id      = chat_id,
+                    text         = self.formatter.signal_message(signal, elapsed),
+                    parse_mode   = ParseMode.MARKDOWN,
+                    reply_markup = build_post_signal_keyboard()
+                )
+            except Exception as e:
+                logger.error(f"Send signal error to {chat_id}: {e}")
+        else:
+            try:
+                await bot.send_message(
+                    chat_id      = chat_id,
+                    text         = self.formatter.no_signal_message(symbol),
+                    parse_mode   = ParseMode.MARKDOWN,
+                    reply_markup = build_post_signal_keyboard()
+                )
+            except Exception as e:
+                logger.error(f"Send no-signal error to {chat_id}: {e}")
+
+    # ── AUTO-SCAN JOB ─────────────────────────────────────────────────────
+
+    async def _auto_scan_job(self, ctx: ContextTypes.DEFAULT_TYPE):
+        """
+        Background repeating job — fires every SCAN_INTERVAL seconds.
+        Scans the user's single active pair only.
+        """
+        chat_id = ctx.job.data["chat_id"]
+
+        if chat_id in self.state.paused:
+            return
+
+        symbol = self.state.active_pair.get(chat_id)
+        if not symbol:
+            return
+
+        signal  = await self._analyse_asset(symbol)
+        elapsed = await self.feed.get_current_seconds_into_minute()
+
+        if signal:
+            self._record_stat(chat_id, signal)
+            try:
+                await ctx.bot.send_message(
+                    chat_id      = chat_id,
+                    text         = self.formatter.signal_message(signal, elapsed),
+                    parse_mode   = ParseMode.MARKDOWN,
+                    reply_markup = build_post_signal_keyboard()
+                )
+            except Exception as e:
+                logger.error(f"Auto-scan send error to {chat_id}: {e}")
+        # No signal on auto-scan = silent (don't flood with no-signal messages)
+
+    # ── CORE ANALYSIS PIPELINE ────────────────────────────────────────────
+
+    async def _analyse_asset(self, symbol: str) -> Optional[FinalSignal]:
+        """Full pipeline: resolve symbol → fetch candles → analyse → return signal."""
+        try:
+            fetch_symbol = symbol if isinstance(self.feed, PocketOptionFeed) else resolve_symbol(symbol)
+
+            raw_candles = await self.feed.fetch_candles(
+                fetch_symbol, interval="1min", count=60
+            )
+            if len(raw_candles) < 10:
+                return None
+
+            candles = [
+                Candle(
+                    open   = c["open"],
+                    high   = c["high"],
+                    low    = c["low"],
+                    close  = c["close"],
+                    volume = c.get("volume", 0.0)
+                )
+                for c in raw_candles
+            ]
+
+            raw_forming = await self.feed.fetch_live_quote(fetch_symbol)
+            forming = Candle(
+                open   = raw_forming["open"],
+                high   = raw_forming["high"],
+                low    = raw_forming["low"],
+                close  = raw_forming["close"],
+                volume = raw_forming.get("volume", 0.0)
+            ) if raw_forming else None
+
+            elapsed = await self.feed.get_current_seconds_into_minute()
+            ts      = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+            return self.engine.evaluate(
+                asset           = symbol,
+                candles         = candles,
+                forming_candle  = forming,
+                elapsed_seconds = elapsed,
+                timestamp       = ts
+            )
+
+        except Exception as e:
+            logger.error(f"Analysis error [{symbol}]: {e}")
+            return None
+
+    # ── RUN ───────────────────────────────────────────────────────────────
+
+    async def run(self):
+        logger.info("🤖 Binary Signal Robot v2.1 starting...")
+        try:
+            await self.app.initialize()
+            await self.app.start()
+            await self.app.updater.start_polling(drop_pending_updates=True)
+            logger.info("🚀 Bot is live — waiting for commands...")
+            await asyncio.Event().wait()   # Run forever
+        finally:
+            try:
+                await self.app.updater.stop()
+                await self.app.stop()
+                await self.app.shutdown()
+            except Exception:
+                pass
+            await self.feed.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    TWELVE_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
+
+    if not TELEGRAM_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN not set in .env")
+    if not TWELVE_API_KEY:
+        raise ValueError("TWELVE_DATA_API_KEY not set in .env")
+
+    bot = BinarySignalBot(TELEGRAM_TOKEN, TWELVE_API_KEY)
+    asyncio.run(bot.run())
+
+
+
+
+
+
+
+Final PO Data feed.pyto work with fixed WS session timeout.
+
+
+
+"""
+po_data_feed.py — Pocket Option Direct Data Feed (v8.3-stable)
+
+FIXES v8.3
+────────────────────────────────────────
+- Fixed non-candle payload parsing crash
+- Added strict candle validation
+- Skips asset metadata packets safely
+- Improved websocket stability
+- Better PocketOption compatibility
+- Graceful reconnect handling
+- Full RAW logging
+"""
+
+import asyncio
+import json
+import logging
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+try:
+    import websockets
+    from websockets.exceptions import ConnectionClosed
+except ImportError:
+    raise ImportError("websockets is required: pip install websockets")
+
+logger = logging.getLogger("PocketOptionFeed")
+
+
+def _decode(msg) -> str:
+    if isinstance(msg, (bytes, bytearray)):
+        return msg.decode("utf-8", errors="replace")
+    return msg
+
+
+def _normalize(symbol: str) -> str:
+    return (
+        symbol.lstrip("#")
+        .replace("_otc", "")
+        .replace("-OTC", "")
+        .replace("-otc", "")
+        .replace("/", "")
+        .replace(" ", "")
+        .upper()
+    )
+
+
+class PocketOptionFeed:
+
+    OTC_ASSETS = {
+        "EUR/USD-OTC": 66,
+        "GBP/USD-OTC": 86,
+        "USD/JPY-OTC": 93,
+        "AUD/USD-OTC": 71,
+        "USD/CAD-OTC": 91,
+        "USD/CHF-OTC": 92,
+        "EUR/JPY-OTC": 79,
+        "EUR/GBP-OTC": 78,
+        "GBP/JPY-OTC": 84,
+        "NZD/USD-OTC": 90,
+        "EUR/AUD-OTC": 44,
+        "AUD/JPY-OTC": 69,
+    }
+
+    _NORM_TO_SYMBOL = {}
+
+    _WS_DEMO = (
+        "wss://demo-api-eu.po.market/socket.io/?EIO=4&transport=websocket"
+    )
+
+    _WS_LIVE = (
+        "wss://api-eu.po.market/socket.io/?EIO=4&transport=websocket"
+    )
+
+    _HISTORY_EVENTS = {
+        "loadHistoryPeriod",
+        "history",
+        "candles",
+        "chartData",
+        "updateChartData",
+        "successHistory",
+    }
+
+    def __init__(self, ssid: str = "", demo: bool = True):
+
+        self.demo = demo
+        self._raw_ssid = ssid.strip()
+
+        self.session_token = ""
+        self.uid = ""
+
+        self.keepalive_task = None
+
+        if ssid:
+
+            try:
+
+                start = ssid.find("{")
+                end = ssid.rfind("}") + 1
+
+                if start >= 0 and end > start:
+
+                    data = json.loads(ssid[start:end])
+
+                    self.session_token = (
+                        data.get("sessionToken")
+                        or data.get("session", "")
+                    )
+
+                    self.uid = data.get("uid", "")
+
+                logger.info(f"SSID parsed — uid={self.uid}")
+
+            except Exception as e:
+                logger.error(f"SSID parse failed: {e}")
+
+        PocketOptionFeed._NORM_TO_SYMBOL = {
+            _normalize(sym): sym
+            for sym in self.OTC_ASSETS
+        }
+
+        self.ws_url = (
+            self._WS_DEMO
+            if demo
+            else self._WS_LIVE
+        )
+
+    # ─────────────────────────────────────────────
+
+    async def connect(self):
+        return True
+
+    async def close(self):
+
+        if self.keepalive_task:
+            self.keepalive_task.cancel()
+
+    async def get_current_seconds_into_minute(self) -> int:
+        return datetime.now(timezone.utc).second
+
+    # ─────────────────────────────────────────────
+
+    async def fetch_live_quote(
+        self,
+        symbol: str
+    ) -> Optional[dict]:
+
+        candles = await self.fetch_candles(
+            symbol=symbol,
+            interval="1min",
+            count=2
+        )
+
+        if candles:
+            return candles[-1]
+
+        return None
+
+    # ─────────────────────────────────────────────
+
+    async def fetch_candles(
+        self,
+        symbol: str,
+        interval: str = "1min",
+        count: int = 60,
+    ) -> list:
+
+        asset_id = self.OTC_ASSETS.get(symbol)
+
+        if asset_id is None:
+            logger.error(f"Unknown asset: {symbol}")
+            return []
+
+        period = {
+            "1min": 60,
+            "1m": 60,
+            "5min": 300,
+            "15min": 900,
+        }.get(interval, 60)
+
+        for attempt in range(2):
+
+            try:
+
+                async with await self._open_authenticated_ws() as ws:
+
+                    logger.info(
+                        f"📡 Requesting candles for "
+                        f"{symbol} "
+                        f"(asset={asset_id}, period={period})"
+                    )
+
+                    candles = await self._request_candles(
+                        ws,
+                        asset_id,
+                        period,
+                        count
+                    )
+
+                    if candles:
+                        return candles
+
+            except Exception as e:
+
+                logger.error(
+                    f"fetch_candles failed: {e}",
+                    exc_info=True
+                )
+
+            await asyncio.sleep(3)
+
+        return []
+
+    # ─────────────────────────────────────────────
+    # WEBSOCKET
+    # ─────────────────────────────────────────────
+
+    async def _open_authenticated_ws(self):
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 "
+                "(Windows NT 10.0; Win64; x64)"
+            ),
+            "Origin": "https://pocketoption.com",
+            "Referer": "https://pocketoption.com/",
+        }
+
+        ws = await websockets.connect(
+            self.ws_url,
+            additional_headers=headers,
+            ping_interval=None,
+            open_timeout=15,
+            close_timeout=5,
+            max_size=None,
+        )
+
+        msg = _decode(
+            await asyncio.wait_for(
+                ws.recv(),
+                timeout=10
+            )
+        )
+
+        logger.info(f"[OPEN] {repr(msg)}")
+
+        if not msg.startswith("0"):
+            raise Exception(f"Bad EIO open packet: {msg}")
+
+        await ws.send("40")
+
+        namespace_ok = False
+
+        for _ in range(10):
+
+            msg = _decode(
+                await asyncio.wait_for(
+                    ws.recv(),
+                    timeout=10
+                )
+            )
+
+            logger.info(
+                f"[NAMESPACE] {repr(msg)}"
+            )
+
+            if msg == "2":
+                await ws.send("3")
+                continue
+
+            if msg.startswith("40"):
+                namespace_ok = True
+                break
+
+        if not namespace_ok:
+            raise Exception("Namespace connect failed")
+
+        await ws.send(self._raw_ssid)
+
+        logger.info(f"Auth sent (uid={self.uid})")
+
+        self.keepalive_task = asyncio.create_task(
+            self._keepalive(ws)
+        )
+
+        await self._capture_asset_map(ws)
+
+        await asyncio.sleep(2)
+
+        return ws
+
+    # ─────────────────────────────────────────────
+
+    async def _keepalive(self, ws):
+
+        try:
+
+            while True:
+
+                await asyncio.sleep(20)
+
+                try:
+                    await ws.send("2")
+                    logger.debug("Ping sent")
+
+                except:
+                    break
+
+        except asyncio.CancelledError:
+            pass
+
+    # ─────────────────────────────────────────────
+
+    async def _capture_asset_map(self, ws):
+
+        expecting_assets = False
+
+        for _ in range(50):
+
+            try:
+
+                msg = _decode(
+                    await asyncio.wait_for(
+                        ws.recv(),
+                        timeout=5
+                    )
+                )
+
+            except asyncio.TimeoutError:
+                continue
+
+            except ConnectionClosed:
+                logger.warning(
+                    "WS closed during auth"
+                )
+                return
+
+            logger.info(
+                f"[AUTH PHASE] {repr(msg[:200])}"
+            )
+
+            if msg == "2":
+                await ws.send("3")
+                continue
+
+            if (
+                msg.startswith("451-")
+                and "updateAssets" in msg
+            ):
+                expecting_assets = True
+                continue
+
+            if expecting_assets and msg.startswith("[["):
+
+                self._build_asset_map(msg)
+
+                logger.info(
+                    "✅ Asset map captured"
+                )
+
+                return
+
+    # ─────────────────────────────────────────────
+
+    def _build_asset_map(self, payload_str: str):
+
+        try:
+            assets = json.loads(payload_str)
+
+        except Exception as e:
+            logger.error(
+                f"Asset parse failed: {e}"
+            )
+            return
+
+        new_map = {}
+
+        for entry in assets:
+
+            if not isinstance(entry, list):
+                continue
+
+            if len(entry) < 2:
+                continue
+
+            asset_id = entry[0]
+            po_symbol = str(entry[1])
+
+            norm = _normalize(po_symbol)
+
+            if norm in self._NORM_TO_SYMBOL:
+
+                canonical = (
+                    self._NORM_TO_SYMBOL[norm]
+                )
+
+                new_map[canonical] = asset_id
+
+        if new_map:
+
+            self.OTC_ASSETS.update(new_map)
+
+            logger.info(
+                f"✅ Asset map updated "
+                f"({len(new_map)} assets)"
+            )
+
+    # ─────────────────────────────────────────────
+    # CANDLES
+    # ─────────────────────────────────────────────
+
+    async def _request_candles(
+        self,
+        ws,
+        asset_id: int,
+        period: int,
+        count: int,
+    ) -> list:
+
+        change_symbol = (
+            '42["changeSymbol",{'
+            f'"asset":{asset_id},'
+            f'"period":{period}'
+            '}]'
+        )
+
+        history_request = (
+            '42["loadHistoryPeriod",{'
+            f'"asset":{asset_id},'
+            f'"period":{period},'
+            f'"time":{int(time.time())},'
+            '"index":0,'
+            '"offset":0'
+            '}]'
+        )
+
+        logger.info(f"→ {change_symbol}")
+        await ws.send(change_symbol)
+
+        await asyncio.sleep(2)
+
+        logger.info(f"→ {history_request}")
+        await ws.send(history_request)
+
+        deadline = time.time() + 30
+
+        try:
+
+            while time.time() < deadline:
+
+                try:
+
+                    raw = await asyncio.wait_for(
+                        ws.recv(),
+                        timeout=5
+                    )
+
+                    msg = _decode(raw)
+
+                    logger.info(
+                        f"[FULL RAW] {repr(msg)}"
+                    )
+
+                except asyncio.TimeoutError:
+                    continue
+
+                except ConnectionClosed:
+
+                    logger.warning(
+                        "WS closed by PocketOption"
+                    )
+
+                    break
+
+                if msg == "2":
+                    await ws.send("3")
+                    continue
+
+                # ─────────────────────
+                # 451 events
+                # ─────────────────────
+
+                if msg.startswith("451-"):
+
+                    try:
+
+                        json_part = (
+                            msg[msg.index("["):]
+                        )
+
+                        payload = json.loads(
+                            json_part
+                        )
+
+                        event = payload[0]
+
+                        logger.info(
+                            f"[451 EVENT] {event}"
+                        )
+
+                    except:
+                        continue
+
+                    continue
+
+                # ─────────────────────
+                # Binary attachment
+                # ─────────────────────
+
+                if msg.startswith("[["):
+
+                    candles = self._parse_candles(
+                        msg,
+                        count
+                    )
+
+                    if candles:
+
+                        logger.info(
+                            f"✅ Parsed "
+                            f"{len(candles)} candles "
+                            f"from binary attachment"
+                        )
+
+                        if self.keepalive_task:
+                            self.keepalive_task.cancel()
+
+                        return candles
+
+                # ─────────────────────
+                # 42 events
+                # ─────────────────────
+
+                if msg.startswith("42"):
+
+                    try:
+
+                        payload = json.loads(
+                            msg[2:]
+                        )
+
+                    except:
+                        continue
+
+                    if not isinstance(payload, list):
+                        continue
+
+                    if len(payload) < 2:
+                        continue
+
+                    event = payload[0]
+                    data = payload[1]
+
+                    logger.info(
+                        f"← EVENT: {event}"
+                    )
+
+                    if event in self._HISTORY_EVENTS:
+
+                        candles = self._parse_candles(
+                            data,
+                            count
+                        )
+
+                        if candles:
+
+                            logger.info(
+                                f"✅ Parsed "
+                                f"{len(candles)} candles"
+                            )
+
+                            if self.keepalive_task:
+                                self.keepalive_task.cancel()
+
+                            return candles
+
+        finally:
+
+            if self.keepalive_task:
+                self.keepalive_task.cancel()
+
+        logger.warning(
+            "❌ Candle request timed out"
+        )
+
+        return []
+
+    # ─────────────────────────────────────────────
+    # PARSER
+    # ─────────────────────────────────────────────
+
+    def _parse_candles(
+        self,
+        data,
+        count: int
+    ) -> list:
+
+        candles = []
+
+        try:
+
+            if isinstance(data, str):
+
+                try:
+                    data = json.loads(data)
+                except:
+                    pass
+
+            raw = None
+
+            if isinstance(data, list):
+                raw = data
+
+            elif isinstance(data, dict):
+
+                raw = (
+                    data.get("candles")
+                    or data.get("history")
+                    or data.get("data")
+                    or data.get("result")
+                )
+
+            if not raw:
+                return []
+
+            for c in raw[-count:]:
+
+                # ─────────────────────
+                # Dict candle
+                # ─────────────────────
+
+                if isinstance(c, dict):
+
+                    try:
+
+                        candles.append({
+                            "open": float(
+                                c.get("open", c.get("o", 0))
+                            ),
+                            "high": float(
+                                c.get("high", c.get("h", 0))
+                            ),
+                            "low": float(
+                                c.get("low", c.get("l", 0))
+                            ),
+                            "close": float(
+                                c.get("close", c.get("c", 0))
+                            ),
+                            "volume": float(
+                                c.get("volume", c.get("v", 0))
+                            ),
+                        })
+
+                    except:
+                        continue
+
+                # ─────────────────────
+                # List candle
+                # ─────────────────────
+
+                elif (
+                    isinstance(c, (list, tuple))
+                    and len(c) >= 5
+                ):
+
+                    # FIX v8.3
+                    # Validate candle structure
+
+                    try:
+
+                        open_price = float(c[1])
+                        high_price = float(c[2])
+                        low_price = float(c[3])
+                        close_price = float(c[4])
+
+                    except (ValueError, TypeError):
+
+                        logger.warning(
+                            f"Skipping non-candle payload: "
+                            f"{repr(c[:10])}"
+                        )
+
+                        continue
+
+                    candles.append({
+                        "open": open_price,
+                        "high": high_price,
+                        "low": low_price,
+                        "close": close_price,
+                        "volume": (
+                            float(c[5])
+                            if (
+                                len(c) > 5
+                                and isinstance(
+                                    c[5],
+                                    (int, float)
+                                )
+                            )
+                            else 0.0
+                        ),
+                    })
+
+        except Exception as e:
+
+            logger.error(
+                f"Candle parse failed: {e}",
+                exc_info=True
+            )
+
+        return candles
+
+
+
+
+
+
+
+"""
+╔══════════════════════════════════════════════════════════════╗
+║              CONFLUENCE & SIGNAL ENGINE  v3.1                ║
+║   Combines candle psychology + EMA + S/R + CRT + Volume      ║
+║   + RSI + ATR + Momentum + Session + Cooldown                ║
+║                                                              ║
+║   LAYERS:                                                    ║
+║   Layer 1 — Candle Psychology (12+ patterns)                 ║
+║   Layer 2 — EMA 9/21/50 + Support/Resistance                 ║
+║   Layer 3 — CRT + Volume sweep detection                     ║
+║   Layer 4 — Accuracy Filters (RSI/ATR/Session/Cooldown)      ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+
+from dataclasses import dataclass, field
+from typing import Optional
+from candle_psychology import Candle, CandleSignal, CandlePsychologyEngine
+from crt_volume_engine import CRTVolumeEngine
+from filters import run_all_filters, SignalCooldownTracker
+
+import statistics
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA CLASSES
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class TechnicalLevels:
+    ema_9:              float = 0.0
+    ema_21:             float = 0.0
+    ema_50:             float = 0.0
+    support_levels:     list  = field(default_factory=list)
+    resistance_levels:  list  = field(default_factory=list)
+    trend:              str   = "SIDEWAYS"   # BULLISH | BEARISH | SIDEWAYS
+
+
+@dataclass
+class FinalSignal:
+    asset:               str
+    direction:           str           # CALL | PUT
+    confidence:          int           # 0–100
+    candle_pattern:      str
+    candle_description:  str
+    candle_emoji:        str
+    confluence_factors:  list          # list of strings for Telegram message
+    entry_note:          str
+    expiry:              str  = "1 MINUTE"
+    timestamp:           str  = ""
+    pre_close:           bool = False  # True if pre-close (ENTER NOW) alert
+    session:             str  = ""     # Trading session label e.g. "LONDON" | "NEW_YORK"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFLUENCE ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ConfluenceEngine:
+    """
+    Four-layer signal engine for M1 binary options.
+
+    All layers must agree on direction for highest confidence.
+    Any hard conflict between layers suppresses the signal.
+    """
+
+    SIGNAL_THRESHOLD = 62   # minimum confidence % to emit a signal
+
+    def __init__(self):
+        self.psychology = CandlePsychologyEngine()
+        self.crt        = CRTVolumeEngine(min_confidence=55)
+        self.cooldown   = SignalCooldownTracker()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ASSET TYPE HELPER
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _get_asset_type(self, asset: str) -> str:
+        base = asset.replace("-OTC", "").upper()
+        if any(k in base for k in ["BTC", "ETH", "BNB", "SOL", "XRP"]):
+            return "crypto"
+        if any(k in base for k in ["XAU", "XAG", "GOLD", "SILVER", "OIL", "USOIL", "UKOIL"]):
+            return "commodity"
+        if any(k in base for k in ["SPX", "NDX", "DJI", "FTSE", "DAX", "NAS", "SP500"]):
+            return "index"
+        if "/" not in base and len(base) <= 5 and base.isalpha():
+            return "stock"
+        return "forex"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # EMA + LEVELS
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def calculate_ema(self, prices: list, period: int) -> float:
+        if len(prices) < period:
+            return prices[-1] if prices else 0.0
+        k   = 2 / (period + 1)
+        ema = statistics.mean(prices[:period])
+        for price in prices[period:]:
+            ema = price * k + ema * (1 - k)
+        return ema
+
+    def get_levels(self, candles: list) -> TechnicalLevels:
+        if not candles:
+            return TechnicalLevels()
+
+        closes = [c.close for c in candles]
+        highs  = [c.high  for c in candles]
+        lows   = [c.low   for c in candles]
+
+        ema9  = self.calculate_ema(closes, 9)
+        ema21 = self.calculate_ema(closes, 21)
+        ema50 = self.calculate_ema(closes, min(50, len(closes)))
+
+        resistance = sorted(set(round(h, 5) for h in sorted(highs)[-10:]))
+        support    = sorted(set(round(l, 5) for l in sorted(lows)[:10]))
+
+        if ema9 > ema21 > ema50:
+            trend = "BULLISH"
+        elif ema9 < ema21 < ema50:
+            trend = "BEARISH"
+        else:
+            trend = "SIDEWAYS"
+
+        return TechnicalLevels(
+            ema_9=ema9, ema_21=ema21, ema_50=ema50,
+            support_levels=support, resistance_levels=resistance, trend=trend
+        )
+
+    def at_key_level(self, price: float, levels: TechnicalLevels) -> tuple:
+        tolerance = price * 0.0008
+        for r in levels.resistance_levels:
+            if abs(price - r) <= tolerance:
+                return True, f"At Resistance ({r:.5f})"
+        for s in levels.support_levels:
+            if abs(price - s) <= tolerance:
+                return True, f"At Support ({s:.5f})"
+        for ema_val, ema_name in [
+            (levels.ema_9,  "EMA 9"),
+            (levels.ema_21, "EMA 21"),
+            (levels.ema_50, "EMA 50"),
+        ]:
+            if abs(price - ema_val) <= tolerance * 2:
+                return True, f"At {ema_name} ({ema_val:.5f})"
+        return False, ""
+
+    def _candles_to_dicts(self, candles: list) -> list:
+        return [
+            {"open": c.open, "high": c.high,
+             "low":  c.low,  "close": c.close, "volume": c.volume}
+            for c in candles
+        ]
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # MAIN EVALUATE
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def evaluate(
+        self,
+        asset:           str,
+        candles:         list,
+        forming_candle:  Optional[Candle] = None,
+        elapsed_seconds: float            = 0.0,
+        timestamp:       str              = ""
+    ) -> Optional[FinalSignal]:
+
+        if len(candles) < 5:
+            return None
+
+        levels  = self.get_levels(candles)
+        current = candles[-1]
+
+        # ═════════════════════════════════════════════════════════════════════
+        # LAYER 1 — Candle Psychology
+        # ═════════════════════════════════════════════════════════════════════
+        candle_sig = self.psychology.analyse(candles[-5:])
+        pre_close  = False
+
+        if forming_candle and elapsed_seconds >= 40:
+            live_sig = self.psychology.predict_forming_candle(
+                forming_candle, elapsed_seconds
+            )
+            if live_sig and (candle_sig is None or
+                             live_sig.confidence > candle_sig.confidence * 0.85):
+                candle_sig = live_sig
+                pre_close  = True
+
+        # ═════════════════════════════════════════════════════════════════════
+        # LAYER 2 — CRT + Volume
+        # ═════════════════════════════════════════════════════════════════════
+        candle_dicts = self._candles_to_dicts(candles)
+        forming_dict = (
+            {
+                "open":   forming_candle.open,
+                "high":   forming_candle.high,
+                "low":    forming_candle.low,
+                "close":  forming_candle.close,
+                "volume": forming_candle.volume,
+            }
+            if forming_candle else None
+        )
+
+        crt_sig = self.crt.analyse(
+            asset           = asset,
+            candles         = candle_dicts,
+            forming_candle  = forming_dict,
+            elapsed_seconds = int(elapsed_seconds),
+        )
+
+        # ═════════════════════════════════════════════════════════════════════
+        # LAYER 3 — Direction conflict check (candle ↔ CRT)
+        # ═════════════════════════════════════════════════════════════════════
+        if candle_sig and crt_sig:
+            if candle_sig.direction != crt_sig.direction:
+                return None
+
+        if candle_sig is None and crt_sig is None:
+            return None
+
+        lead_direction = (candle_sig.direction if candle_sig
+                          else crt_sig.direction)
+
+        # ═════════════════════════════════════════════════════════════════════
+        # EMA + S/R confluence scoring
+        # ═════════════════════════════════════════════════════════════════════
+        confluence = []
+        boost      = 0.0
+
+        if lead_direction == "CALL" and levels.trend == "BULLISH":
+            confluence.append("✅ EMA trend aligns BULLISH (9 > 21 > 50)")
+            boost += 0.08
+        elif lead_direction == "PUT" and levels.trend == "BEARISH":
+            confluence.append("✅ EMA trend aligns BEARISH (9 < 21 < 50)")
+            boost += 0.08
+        elif levels.trend == "SIDEWAYS":
+            confluence.append("⚠️ Sideways trend — lower reliability")
+            boost -= 0.04
+        else:
+            confluence.append("❌ Counter-trend signal — use caution")
+            boost -= 0.10
+
+        if levels.ema_9 != 0 and levels.ema_21 != 0:
+            gap = abs(levels.ema_9 - levels.ema_21) / current.close * 100
+            if gap > 0.05:
+                confluence.append(f"✅ EMA spread {gap:.3f}% — trending momentum")
+                boost += 0.04
+            else:
+                confluence.append(f"⚠️ EMAs flat ({gap:.3f}%) — choppy market")
+                boost -= 0.02
+
+        at_level, level_desc = self.at_key_level(current.close, levels)
+        if at_level:
+            confluence.append(f"✅ {level_desc} — highest-probability zone")
+            boost += 0.12
+
+        if candle_sig and candle_sig.sub_patterns:
+            extras = ", ".join(candle_sig.sub_patterns)
+            confluence.append(f"✅ Confirmed by: {extras}")
+            boost += 0.05 * len(candle_sig.sub_patterns)
+
+        if current.body_ratio > 0.55:
+            confluence.append(
+                f"✅ Strong candle body ({current.body_ratio:.0%}) — high conviction"
+            )
+            boost += 0.04
+        elif current.body_ratio < 0.20:
+            confluence.append("⚠️ Small candle body — weak conviction")
+            boost -= 0.03
+
+        if crt_sig:
+            confluence.append("━━━ CRT + VOLUME LAYER ━━━")
+            confluence.extend(crt_sig.confluence_factors)
+            crt_boost = (crt_sig.confidence / 100) * 0.15
+            boost += crt_boost
+
+        # ── Base confidence pre-filter ────────────────────────────────────────
+        base_conf = (candle_sig.confidence if candle_sig
+                     else (crt_sig.confidence / 100))
+        raw = base_conf + boost
+
+        # ═════════════════════════════════════════════════════════════════════
+        # LAYER 4 — Accuracy Filters (RSI / ATR / Session / Cooldown)
+        # ═════════════════════════════════════════════════════════════════════
+        is_otc     = asset.endswith("-OTC")
+        asset_type = self._get_asset_type(asset)
+        closes     = [c.close for c in candles]
+
+        filter_result = run_all_filters(
+            asset        = asset,
+            asset_type   = asset_type,
+            direction    = lead_direction,
+            candle_dicts = candle_dicts,
+            closes       = closes,
+            cooldown     = self.cooldown,
+            is_otc       = is_otc,
+        )
+
+        if filter_result.suppress:
+            return None
+
+        raw += filter_result.confidence_delta
+
+        if filter_result.factors:
+            confluence.append("━━━ ACCURACY FILTERS ━━━")
+            confluence.extend(filter_result.factors)
+
+        # ── Final confidence gate ─────────────────────────────────────────────
+        final_pct = int(max(0, min(raw, 0.97)) * 100)
+
+        # ── Asset-aware confidence band filter ───────────────────────────────
+        #
+        #   OTC pairs   -> emit ONLY genuine 60-69%
+        #                  No clamping — if the engine scores above 69%, reject.
+        #                  Only raw setups that naturally land in this band pass.
+        #
+        #   Forex pairs -> emit 50-69%  OR  > 95%
+        #   Everything else -> emit >= SIGNAL_THRESHOLD (62%)
+        #
+        if is_otc:
+            if not (60 <= final_pct <= 69):
+                return None
+        elif asset_type == "forex":
+            if not (50 <= final_pct <= 69 or final_pct > 95):
+                return None
+        else:
+            if final_pct < self.SIGNAL_THRESHOLD:
+                return None
+
+        # ── Smart Expiry ──────────────────────────────────────────────────────
+        ema_gap = abs(levels.ema_9 - levels.ema_21) / current.close * 100
+
+        expiry = self.determine_expiry(
+            confidence = final_pct,
+            trend      = levels.trend,
+            ema_gap    = ema_gap,
+            body_ratio = current.body_ratio,
+            crt_sig    = crt_sig,
+            pre_close  = pre_close,
+            is_otc     = is_otc,
+        )
+
+        # ── Pattern label ─────────────────────────────────────────────────────
+        if candle_sig and crt_sig:
+            pattern     = (
+                f"{candle_sig.pattern} + CRT "
+                f"{crt_sig.sweep_side.replace('_', ' ').title()}"
+            )
+            description = candle_sig.description
+            emoji       = candle_sig.emoji + " 📐"
+        elif crt_sig:
+            pattern     = f"CRT {crt_sig.sweep_side.replace('_', ' ').title()}"
+            description = (
+                f"CRT sweep detected — Vol spike {crt_sig.volume.volume_ratio:.1f}x | "
+                f"Range: {crt_sig.zone.range_low:.5f}–{crt_sig.zone.range_high:.5f}"
+            )
+            emoji       = "📐⚡"
+        else:
+            pattern     = candle_sig.pattern
+            description = candle_sig.description
+            emoji       = candle_sig.emoji
+
+        # ── Entry note ────────────────────────────────────────────────────────
+        if pre_close:
+            entry_note = (
+                f"⚡ PRE-CLOSE ALERT at {elapsed_seconds:.0f}s — "
+                "Enter NOW on next candle open"
+            )
+        else:
+            entry_note = "Enter at open of NEXT candle after current closes"
+
+        # ── Resolve session label (used by MessageFormatter / bot.py) ──────────
+        session_label = getattr(filter_result, "session", "") or ""
+
+        # ── Build final signal ────────────────────────────────────────────────
+        signal = FinalSignal(
+            asset              = asset,
+            direction          = lead_direction,
+            confidence         = final_pct,
+            candle_pattern     = pattern,
+            candle_description = description,
+            candle_emoji       = emoji,
+            confluence_factors = confluence,
+            entry_note         = entry_note,
+            expiry             = expiry,
+            timestamp          = timestamp,
+            pre_close          = pre_close,
+            session            = session_label,
+        )
+
+        # Record cooldown
+        self.cooldown.record(asset, lead_direction)
+
+        return signal
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SMART EXPIRY
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def determine_expiry(
+        self,
+        confidence: int,
+        trend:      str,
+        ema_gap:    float,
+        body_ratio: float,
+        crt_sig,
+        pre_close:  bool,
+        is_otc:     bool,
+    ) -> str:
+        """
+        Smart expiry calculation based on confidence, trend, and CRT signals.
+        """
+        # Pre-close always 1 min (entering at next candle open)
+        if pre_close:
+            return "1 MINUTE"
+
+        # High confidence strong trend
+        if confidence >= 80 and trend in ("BULLISH", "BEARISH") and ema_gap > 0.05:
+            return "2 MINUTES"
+
+        # CRT sweep with high confidence
+        if crt_sig and confidence >= 75:
+            return "2 MINUTES"
+
+        # Sideways or low confidence = shorter
+        if trend == "SIDEWAYS" or confidence < 68:
+            return "1 MINUTE"
+
+        # OTC default: 1 min (tighter market, faster reversals)
+        if is_otc:
+            return "1 MINUTE"
+
+        return "1 MINUTE"
+
+
+
+
+
+
+
+
+"""
+╔══════════════════════════════════════════════════════════════╗
+║         data_feed.py — TWELVE DATA FEED                      ║
+║   Verified against Twelve Data API response format           ║
+║                                                              ║
+║   KEY FACTS (from API docs):                                 ║
+║   • All OHLCV fields come back as STRINGS — must cast        ║
+║   • Values array is DESCENDING (newest first) — must flip    ║
+║   • Forex volume = tick count (not real lot volume)          ║
+║   • Volume field absent on some exotic pairs — handled       ║
+║   • Quote endpoint returns float strings for live candle     ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+
+import asyncio
+import logging
+import time
+from datetime import datetime, timezone
+from typing import Optional
+import aiohttp
+
+logger = logging.getLogger("DataFeed")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ASSET CATALOGUE
+# ─────────────────────────────────────────────────────────────────────────────
+
+ASSET_CATALOGUE = {
+    "Forex": {
+        "EUR/USD": {"name": "Euro / US Dollar",            "type": "forex"},
+        "GBP/USD": {"name": "British Pound / US Dollar",   "type": "forex"},
+        "USD/JPY": {"name": "US Dollar / Japanese Yen",    "type": "forex"},
+        "AUD/USD": {"name": "Australian Dollar / USD",     "type": "forex"},
+        "USD/CAD": {"name": "US Dollar / Canadian Dollar", "type": "forex"},
+        "USD/CHF": {"name": "US Dollar / Swiss Franc",     "type": "forex"},
+        "EUR/JPY": {"name": "Euro / Japanese Yen",         "type": "forex"},
+        "EUR/GBP": {"name": "Euro / British Pound",        "type": "forex"},
+        "GBP/JPY": {"name": "British Pound / Japanese Yen","type": "forex"},
+        "NZD/USD": {"name": "New Zealand Dollar / USD",    "type": "forex"},
+        "EUR/AUD": {"name": "Euro / Australian Dollar",    "type": "forex"},
+        "AUD/JPY": {"name": "Australian Dollar / JPY",     "type": "forex"},
+    },
+    "Crypto": {
+        "BTC/USD": {"name": "Bitcoin / US Dollar",         "type": "crypto"},
+        "ETH/USD": {"name": "Ethereum / US Dollar",        "type": "crypto"},
+        "BNB/USD": {"name": "Binance Coin / US Dollar",    "type": "crypto"},
+        "SOL/USD": {"name": "Solana / US Dollar",          "type": "crypto"},
+        "XRP/USD": {"name": "Ripple / US Dollar",          "type": "crypto"},
+    },
+    "Commodities": {
+        "XAU/USD": {"name": "Gold / US Dollar",            "type": "commodity"},
+        "XAG/USD": {"name": "Silver / US Dollar",          "type": "commodity"},
+        "USOIL":   {"name": "US Crude Oil (WTI)",          "type": "commodity"},
+        "UKOIL":   {"name": "UK Crude Oil (Brent)",        "type": "commodity"},
+    },
+    "Indices": {
+        "SPX":     {"name": "S&P 500 Index",               "type": "index"},
+        "NDX":     {"name": "NASDAQ 100 Index",            "type": "index"},
+        "DJI":     {"name": "Dow Jones Industrial",        "type": "index"},
+        "FTSE":    {"name": "FTSE 100 Index",              "type": "index"},
+        "DAX":     {"name": "DAX 40 Index",                "type": "index"},
+    },
+    "Stocks": {
+        "AAPL":    {"name": "Apple Inc.",                  "type": "stock"},
+        "TSLA":    {"name": "Tesla Inc.",                  "type": "stock"},
+        "NVDA":    {"name": "NVIDIA Corporation",          "type": "stock"},
+        "MSFT":    {"name": "Microsoft Corporation",       "type": "stock"},
+        "META":    {"name": "Meta Platforms Inc.",         "type": "stock"},
+        "AMZN":    {"name": "Amazon.com Inc.",             "type": "stock"},
+        "GOOGL":   {"name": "Alphabet Inc.",               "type": "stock"},
+    },
+}
+
+
+def find_asset(symbol: str) -> Optional[dict]:
+    """Find an asset across all categories. Returns asset info dict or None."""
+    for category, assets in ASSET_CATALOGUE.items():
+        if symbol in assets:
+            return {**assets[symbol], "category": category}
+    return None
+
+
+def get_category(symbol: str) -> Optional[str]:
+    """Return the category name for a symbol."""
+    for category, assets in ASSET_CATALOGUE.items():
+        if symbol in assets:
+            return category
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VOLUME HANDLING CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Asset types where Twelve Data returns REAL volume (not tick count)
+REAL_VOLUME_TYPES = {"stock", "index", "crypto", "commodity"}
+
+# Asset types where volume = tick count (still valid for spike detection)
+TICK_VOLUME_TYPES = {"forex"}
+
+# Fallback volume if the field is missing or zero for too many candles
+VOLUME_FALLBACK = 1.0
+
+# Minimum non-zero volume candles required before volume analysis is trusted
+MIN_VOLUME_CANDLES = 10
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CANDLE PARSER — handles Twelve Data's string-typed fields
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _safe_float(value, fallback: float = 0.0) -> float:
+    """
+    Safely cast a Twelve Data field value to float.
+    API returns all OHLCV values as strings — this handles:
+      "148.372"  → 148.372
+      None       → fallback
+      ""         → fallback
+      "N/A"      → fallback
+    """
+    if value is None:
+        return fallback
+    try:
+        result = float(str(value).strip())
+        return result if result == result else fallback  # NaN guard
+    except (ValueError, TypeError):
+        return fallback
+
+
+def _parse_candle(raw: dict, symbol: str = "") -> dict:
+    """
+    Parse a single Twelve Data candle from the 'values' array.
+
+    Raw format (all strings):
+    {
+        "datetime": "2021-08-26 15:59:00",
+        "open":     "148.372",
+        "high":     "148.405",
+        "low":      "148.365",
+        "close":    "148.390",
+        "volume":   "2206"        ← string, may be "0" or absent for forex
+    }
+
+    Returns a properly typed dict with a guaranteed 'volume' float key.
+    """
+    volume_raw = raw.get("volume")
+
+    # Volume handling:
+    # - Forex pairs: "0" is common (tick volume not always provided)
+    # - Missing key: treat as 0 and let the engine handle gracefully
+    volume = _safe_float(volume_raw, fallback=VOLUME_FALLBACK)
+
+    return {
+        "datetime": raw.get("datetime", ""),
+        "open":     _safe_float(raw.get("open")),
+        "high":     _safe_float(raw.get("high")),
+        "low":      _safe_float(raw.get("low")),
+        "close":    _safe_float(raw.get("close")),
+        "volume":   volume,
+    }
+
+
+def _parse_candles(values: list, symbol: str = "") -> list:
+    """
+    Parse and order a full candle list from Twelve Data.
+
+    Twelve Data returns values in DESCENDING order (newest first).
+    We reverse to ascending (oldest first) for correct EMA/analysis.
+    """
+    parsed = [_parse_candle(c, symbol) for c in values]
+    parsed.reverse()   # ascending: oldest → newest
+    return parsed
+
+
+def _assess_volume_quality(candles: list) -> dict:
+    """
+    Analyse the quality of volume data in a candle set.
+
+    Returns a dict with:
+      - has_volume:    bool — enough non-zero volume for spike analysis
+      - zero_pct:      float — percentage of candles with zero volume
+      - avg_volume:    float — mean of non-zero volumes
+      - recommendation: str — human-readable quality note
+    """
+    volumes = [c["volume"] for c in candles]
+    non_zero = [v for v in volumes if v > 0]
+    zero_pct = (len(volumes) - len(non_zero)) / max(len(volumes), 1) * 100
+
+    has_volume = len(non_zero) >= MIN_VOLUME_CANDLES
+    avg_volume = sum(non_zero) / len(non_zero) if non_zero else 0.0
+
+    if zero_pct >= 80:
+        rec = "Volume unavailable for this asset — spike analysis disabled"
+    elif zero_pct >= 40:
+        rec = "Sparse volume data — spike signals may be unreliable"
+    else:
+        rec = "Volume data adequate for spike analysis"
+
+    return {
+        "has_volume":      has_volume,
+        "zero_pct":        zero_pct,
+        "avg_volume":      avg_volume,
+        "recommendation":  rec,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TWELVE DATA FEED
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TwelveDataFeed:
+    """
+    Async HTTP client for Twelve Data API.
+
+    Provides:
+      fetch_candles()      — closed M1 candles with volume, ascending order
+      fetch_live_quote()   — forming (live) candle from /quote endpoint
+      get_current_seconds_into_minute() — timing for pre-close detection
+      validate_api_key()   — startup health check
+    """
+
+    BASE_URL = "https://api.twelvedata.com"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=10)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    # ── CANDLE FETCH ──────────────────────────────────────────────────────────
+
+    async def fetch_candles(
+        self,
+        symbol:   str,
+        interval: str = "1min",
+        count:    int = 60,
+    ) -> list:
+        """
+        Fetch `count` closed M1 candles for `symbol`.
+
+        Returns a list of candle dicts ordered oldest→newest:
+        [
+            {"datetime": ..., "open": float, "high": float,
+             "low": float, "close": float, "volume": float},
+            ...
+        ]
+
+        Volume notes:
+        - Stocks/Crypto/Commodities: real traded volume (float)
+        - Forex: tick volume (number of price ticks per minute)
+        - Both are valid for relative spike detection in CRT analysis
+        - Volume "0" values are preserved (engine handles gracefully)
+        """
+        session = await self._get_session()
+
+        params = {
+            "symbol":     symbol,
+            "interval":   interval,
+            "outputsize": count,
+            "apikey":     self.api_key,
+            "order":      "desc",   # newest first (we reverse after parsing)
+            "format":     "JSON",
+        }
+
+        try:
+            async with session.get(f"{self.BASE_URL}/time_series", params=params) as resp:
+                if resp.status != 200:
+                    logger.error(f"[{symbol}] HTTP {resp.status} from Twelve Data")
+                    return []
+
+                data = await resp.json()
+
+                # API-level error check
+                if data.get("status") == "error":
+                    msg = data.get("message", "Unknown error")
+                    logger.error(f"[{symbol}] Twelve Data error: {msg}")
+                    return []
+
+                values = data.get("values", [])
+                if not values:
+                    logger.warning(f"[{symbol}] No candle data returned")
+                    return []
+
+                # Parse with type coercion + ascending sort
+                candles = _parse_candles(values, symbol)
+
+                # Log volume quality for diagnostics
+                vq = _assess_volume_quality(candles)
+                if vq["zero_pct"] > 40:
+                    logger.warning(
+                        f"[{symbol}] Volume quality: {vq['zero_pct']:.0f}% zero — "
+                        f"{vq['recommendation']}"
+                    )
+                else:
+                    logger.debug(
+                        f"[{symbol}] Volume quality OK — avg={vq['avg_volume']:.0f}, "
+                        f"zero={vq['zero_pct']:.0f}%"
+                    )
+
+                return candles
+
+        except asyncio.TimeoutError:
+            logger.error(f"[{symbol}] Timeout fetching candles")
+            return []
+        except Exception as e:
+            logger.error(f"[{symbol}] fetch_candles error: {e}")
+            return []
+
+    # ── LIVE QUOTE (FORMING CANDLE) ───────────────────────────────────────────
+
+    async def fetch_live_quote(self, symbol: str) -> Optional[dict]:
+        """
+        Fetch the current live/forming candle from the /quote endpoint.
+
+        Twelve Data /quote returns the CURRENT open candle, giving us
+        a real-time snapshot for pre-close analysis.
+
+        Returns a candle dict with volume (may be partial — that's expected).
+        """
+        session = await self._get_session()
+
+        params = {
+            "symbol": symbol,
+            "apikey": self.api_key,
+        }
+
+        try:
+            async with session.get(f"{self.BASE_URL}/quote", params=params) as resp:
+                if resp.status != 200:
+                    logger.error(f"[{symbol}] HTTP {resp.status} from /quote")
+                    return None
+
+                data = await resp.json()
+
+                if data.get("status") == "error":
+                    logger.error(f"[{symbol}] Quote error: {data.get('message')}")
+                    return None
+
+                # /quote response uses same field names — all strings
+                # Fields: open, high, low, close, volume, previous_close, etc.
+                return {
+                    "datetime": data.get("datetime", ""),
+                    "open":     _safe_float(data.get("open")),
+                    "high":     _safe_float(data.get("high")),
+                    "low":      _safe_float(data.get("low")),
+                    "close":    _safe_float(data.get("close")),
+                    "volume":   _safe_float(data.get("volume"), fallback=VOLUME_FALLBACK),
+                }
+
+        except asyncio.TimeoutError:
+            logger.error(f"[{symbol}] Timeout on /quote")
+            return None
+        except Exception as e:
+            logger.error(f"[{symbol}] fetch_live_quote error: {e}")
+            return None
+
+    # ── TIMING ────────────────────────────────────────────────────────────────
+
+    async def get_current_seconds_into_minute(self) -> int:
+        """
+        Returns how many seconds into the current minute we are (0–59).
+        Used by the CRT engine's pre-close detection (40–55s window).
+
+        Based on UTC time to match Twelve Data's candle timestamps.
+        """
+        return datetime.now(timezone.utc).second
+
+    # ── API KEY VALIDATION ────────────────────────────────────────────────────
+
+    async def validate_api_key(self) -> str:
+        """
+        Validate the API key by hitting the /api_usage endpoint.
+
+        Returns one of three strings:
+          "ok"           — key is valid and has credits available
+          "rate_limited" — key is valid but hit per-minute credit cap
+                           (common on free tier if bot ran recently)
+          "invalid"      — key is wrong, expired, or not recognised
+        """
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{self.BASE_URL}/api_usage",
+                params={"apikey": self.api_key}
+            ) as resp:
+                data = await resp.json()
+
+                # HTTP 200 + status ok = all good
+                if resp.status == 200 and data.get("status") == "ok":
+                    return "ok"
+
+                # Rate limit message — key is valid, just throttled
+                message = data.get("message", "") or data.get("code", "")
+                if "run out of API credits" in str(message) or "429" in str(resp.status):
+                    logger.warning(f"API key validation: rate limited — {message}")
+                    return "rate_limited"
+
+                # Anything else (401, wrong key, etc.) = invalid
+                logger.error(f"API key validation failed: {message}")
+                return "invalid"
+
+        except Exception as e:
+            logger.error(f"API key validation error: {e}")
+            # Network error — assume rate limited not invalid (safer default)
+            return "rate_limited"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VOLUME QUALITY CHECKER — call this at startup to verify your data
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def check_volume_availability(
+    feed:    TwelveDataFeed,
+    symbols: list[str],
+) -> dict[str, dict]:
+    """
+    Run a volume quality check across a list of symbols at startup.
+
+    Usage in bot.py:
+        report = await check_volume_availability(self.feed, ["EUR/USD", "BTC/USD", ...])
+        for symbol, info in report.items():
+            logger.info(f"{symbol}: {info['recommendation']}")
+
+    Returns a dict of symbol → volume quality info.
+    """
+    results = {}
+    for symbol in symbols:
+        candles = await feed.fetch_candles(symbol, count=20)
+        if candles:
+            results[symbol] = _assess_volume_quality(candles)
+        else:
+            results[symbol] = {
+                "has_volume":      False,
+                "zero_pct":        100.0,
+                "avg_volume":      0.0,
+                "recommendation":  "Could not fetch candles",
+            }
+    return results
+

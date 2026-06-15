@@ -1,0 +1,4 @@
+# ─── Python Dependencies ───────────────────────────────────────────────────
+python-telegram-bot==21.10
+aiohttp==3.11.18
+python-dotenv==1.0.1
